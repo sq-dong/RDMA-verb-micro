@@ -43,10 +43,13 @@ STYLE = {
 
 # HW-native payload axis (CX-5); old paper ticks kept as comment only.
 # TICKS_FIG2_3 = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
-DEFAULT_SIZES_FULL = [4, 8, 16, 32, 64, 128, 256, 512, 828, 1024, 2048, 4096]
-DEFAULT_SIZES_OUT = [
-    4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 320, 384, 512, 640, 768, 828, 1024, 2048, 4096
-]
+DEFAULT_SIZES_FULL = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+DEFAULT_SIZES_OUT = [4, 8, 16, 32, 64, 128, 256, 512, 828, 956, 1024, 2048, 4096]
+# denser defaults (kept):
+# DEFAULT_SIZES_FULL = [4, 8, 16, 32, 64, 128, 256, 512, 828, 1024, 2048, 4096]
+# DEFAULT_SIZES_OUT = [
+#     4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 320, 384, 512, 640, 768, 828, 956, 1024, 2048, 4096
+# ]
 TICKS_FIG6 = [0, 4, 8, 12, 16]
 
 COLORS = {
@@ -398,7 +401,8 @@ def plot_fig5(results: Path, demo: bool = False):
 
 def plot_fig6(results: Path, demo: bool = False):
     path = results / "fig6.csv"
-    measure = [1, 2, 4, 6, 8, 10, 12, 14, 16]
+    measure = [2, 4, 8, 12, 16]
+    # denser: measure = [1, 2, 4, 6, 8, 10, 12, 14, 16]
     if demo and not path.exists():
         rows = []
         for n in measure:

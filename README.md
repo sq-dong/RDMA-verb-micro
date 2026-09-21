@@ -49,11 +49,11 @@ config is commented in `scripts/paper_config.sh` / `common.h`):
 
 | Figure | X axis | Measured sizes | Inline policy |
 |--------|--------|----------------|---------------|
-| Fig. 2 | 4 … 4096 | WRITE / READ: `…4096`; WR-INLINE / ECHO: `…828` | only WR-INLINE + ECHO |
-| Fig. 3 | 4 … 4096 | all: through 4096 | **no** inline (DMA WRITE / READ) |
-| Fig. 4 | 4 … 4096 | dense to 828/956 then 1K/2K/4K | WR-UC-INLINE ≤828; SEND-UD ≤956; WRITE-UC no |
+| Fig. 2 | 4 … 4096 | WRITE / READ: powers of 2 to 4096; WR-INLINE / ECHO: `…512,828` | only WR-INLINE + ECHO |
+| Fig. 3 | 4 … 4096 | powers of 2 to 4096 | **no** inline (DMA WRITE / READ) |
+| Fig. 4 | 4 … 4096 | powers of 2 + 828/956 cliff | WR-UC-INLINE ≤828; SEND-UD ≤956; WRITE-UC no |
 | Fig. 5 | (bars) | fixed **32** bytes | only `+inlined` bars |
-| Fig. 6 | 0 … 16 processes | `n = 1 2 4 6 8 10 12 14 16`, payload **32** B | all inlined |
+| Fig. 6 | 0 … 16 processes | `n = 2 4 8 12 16`, payload **32** B | all inlined |
 
 `PAPER_INLINE_MAX=828` / `VT_MAX_INLINE=828` = mlx5_0 RC/UC grant;
 `PAPER_INLINE_MAX_UD=956` / `VT_MAX_INLINE_UD=956` for UD. Absolute Mops still
