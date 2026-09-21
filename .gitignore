@@ -1,4 +1,7 @@
 *.o
+
+results/
+
 fig2_latency
 fig3_inbound
 fig4_outbound

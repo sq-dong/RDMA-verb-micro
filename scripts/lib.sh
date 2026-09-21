@@ -19,12 +19,41 @@ mkdir -p "$RESULTS_DIR"
 
 SRV_HOST="${SRV_HOST:-}"
 CLT_HOST="${CLT_HOST:-server03}"
+CLT_HOST2="${CLT_HOST2:-}"
 SRV_DEV="${SRV_DEV:-mlx5_0}"
 CLT_DEV="${CLT_DEV:-mlx5_3}"
+CLT_DEV2="${CLT_DEV2:-mlx5_1}"
 SRV_IP="${SRV_IP:-10.0.0.20}"
 SRV_GID="${SRV_GID:-4}"
 CLT_GID="${CLT_GID:-3}"
+CLT_GID2="${CLT_GID2:-3}"
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no}"
+
+# Clients used for multi-machine sweeps (CLT_HOST always; CLT_HOST2 if set).
+client_hosts() {
+  echo "$CLT_HOST"
+  if [[ -n "${CLT_HOST2:-}" && "$CLT_HOST2" != "none" ]]; then
+    echo "$CLT_HOST2"
+  fi
+}
+
+client_dev_for() {
+  local host=$1
+  if [[ "$host" == "$CLT_HOST" ]]; then
+    echo "$CLT_DEV"
+  else
+    echo "${CLT_DEV2:-$CLT_DEV}"
+  fi
+}
+
+client_gid_for() {
+  local host=$1
+  if [[ "$host" == "$CLT_HOST" ]]; then
+    echo "$CLT_GID"
+  else
+    echo "${CLT_GID2:-$CLT_GID}"
+  fi
+}
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
@@ -62,17 +91,38 @@ kill_pid() {
 }
 
 # Best-effort: kill leftover binaries on a host.
+# IMPORTANT: do NOT use `pkill -f 'fig2_latency|...'` via `bash -lc "..."`.
+# That pattern appears in the bash command line itself, so pkill SIGTERMs the
+# helper shell (exit 143) and `set -e` aborts the collector ("Terminated").
 kill_bench() {
   local host=$1
-  remote "$host" "pkill -f 'fig2_latency|fig3_inbound|fig4_outbound|fig5_echo|fig6_scale' || true"
+  local cmd
+  # -x: match executable name only (not collect_fig2.sh / ssh argv).
+  cmd='pkill -x fig2_latency 2>/dev/null || true; '
+  cmd+='pkill -x fig3_inbound 2>/dev/null || true; '
+  cmd+='pkill -x fig4_outbound 2>/dev/null || true; '
+  cmd+='pkill -x fig5_echo 2>/dev/null || true; '
+  cmd+='pkill -x fig6_scale 2>/dev/null || true; true'
+  remote "$host" "$cmd" || true
 }
 
 sync_bins() {
-  # Ensure binaries exist locally; copy to client if remote.
+  # Ensure binaries exist locally; copy to every client.
+  # Kill leftovers first — scp cannot overwrite a running ELF ("Text file busy").
+  kill_bench "${SRV_HOST:-local}"
+  local h
+  for h in $(client_hosts); do
+    kill_bench "$h"
+  done
+  sleep 0.5
+
   make -C "$BENCH_DIR" -j"$(nproc)" >/dev/null
-  if [[ -n "$CLT_HOST" && "$CLT_HOST" != "local" && "$CLT_HOST" != "localhost" ]]; then
+  for h in $(client_hosts); do
+    if [[ -z "$h" || "$h" == "local" || "$h" == "localhost" ]]; then
+      continue
+    fi
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$CLT_HOST" "mkdir -p '$BENCH_DIR'"
+    ssh $SSH_OPTS "$h" "mkdir -p '$BENCH_DIR'"
     # shellcheck disable=SC2086
     scp $SSH_OPTS -q \
       "$BENCH_DIR"/fig2_latency \
@@ -80,8 +130,8 @@ sync_bins() {
       "$BENCH_DIR"/fig4_outbound \
       "$BENCH_DIR"/fig5_echo \
       "$BENCH_DIR"/fig6_scale \
-      "$CLT_HOST:$BENCH_DIR/"
-  fi
+      "$h:$BENCH_DIR/"
+  done
 }
 
 csv_header() {
@@ -97,4 +147,11 @@ append_csv() {
   shift
   # shellcheck disable=SC2145
   echo "$*" >>"$file"
+}
+
+# Remove intermediate logs after plots are written (keep CSV, png, pdf).
+cleanup_logs() {
+  local dir=${1:-$RESULTS_DIR}
+  rm -f "$dir"/*.log
+  log "removed logs under $dir (csv/png/pdf kept)"
 }

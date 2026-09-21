@@ -11,9 +11,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 CSV="$RESULTS_DIR/fig6.csv"
+rm -f "$CSV"
 csv_header "$CSV" "curve,n,mops"
 
-NQPS=(1 2 4 8 16)
+# Paper Fig.6 x-axis ticks: 0 4 8 12 16
+NQPS=(4 8 12 16)
 SIZE=32
 
 sync_bins
@@ -112,3 +114,4 @@ done
 
 log "wrote $CSV"
 python3 "$SCRIPT_DIR/plot_paper_figs.py" --fig 6 --results-dir "$RESULTS_DIR"
+cleanup_logs "$RESULTS_DIR"

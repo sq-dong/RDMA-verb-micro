@@ -44,24 +44,27 @@ to `-a`, never the management address (`192.168.100.x`).
 
 Pick `-x` from `show_gids` for the RoCEv2 row that matches that IPv4 address.
 
+Payload sweeps follow the paper axis ticks:
+
+| Figure | X axis | Measured sizes |
+|--------|--------|----------------|
+| Fig. 2 | 4 … 1024 | WRITE / WR-INLINE / ECHO: `4..256`; READ: `4..1024` |
+| Fig. 3 | 4 … 1024 | all curves: `4 8 16 32 64 128 256 512 1024` |
+| Fig. 4 | 0 … 256 | `4 8 16 32 64 128 192 256` |
+| Fig. 5 | (bars) | fixed **32** bytes |
+| Fig. 6 | 0 … 16 processes | `n = 4 8 12 16` |
+
+Each `collect_fig*.sh` writes CSV, plots PNG/PDF, then deletes `*.log` (keeps CSV and figures).
+
 ## 4. Automated collect + plot (paper-style figures)
 
-Collectors SSH to the client, start the matching server locally (or on `SRV_HOST`),
-append rows to CSV under `results/`, then call the plotter.
-
 ```bash
-# Configure (example)
-export SRV_IP=10.0.0.20
-export SRV_DEV=mlx5_0
-export SRV_GID=4
-export CLT_HOST=server03
-export CLT_DEV=mlx5_3
-export CLT_GID=3          # RoCEv2 index for 10.0.0.21 on the client
-export BENCH_DIR=$HOME/rdma_verb_test
+# Load cluster / RDMA settings (edit scripts/setup_machine.sh if IPs/GIDs change)
+source ./scripts/setup_machine.sh
 
-# One figure at a time (writes CSV + PNG/PDF)
+# One figure at a time (writes CSV + PNG/PDF; deletes logs, keeps CSV)
 ./scripts/collect_fig2.sh
-./scripts/collect_fig3.sh
+./scripts/collect_fig3.sh   # uses CLT_HOST + CLT_HOST2 if set
 ./scripts/collect_fig4.sh
 ./scripts/collect_fig5.sh
 ./scripts/collect_fig6.sh
@@ -69,6 +72,12 @@ export BENCH_DIR=$HOME/rdma_verb_test
 # Or everything
 ./scripts/collect_all.sh
 ```
+
+**Multi-client (paper Sec.3):** Fig.3 inbound and Fig.6 QP scaling need many
+clients most; Fig.4 outbound also pairs one server proc per client. Fig.2 / Fig.5
+are fine with one. With `CLT_HOST2=thoth` in `setup_machine.sh`, `collect_fig3.sh`
+runs both clients in parallel and **sums** Mops as a stand-in for multi-client
+inbound.
 
 Outputs:
 

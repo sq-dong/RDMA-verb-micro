@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 CSV="$RESULTS_DIR/fig5.csv"
+rm -f "$CSV"
 csv_header "$CSV" "echo_type,opt,mops"
 
 SIZE=32
@@ -68,3 +69,4 @@ done
 
 log "wrote $CSV"
 python3 "$SCRIPT_DIR/plot_paper_figs.py" --fig 5 --results-dir "$RESULTS_DIR"
+cleanup_logs "$RESULTS_DIR"

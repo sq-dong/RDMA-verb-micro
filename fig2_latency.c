@@ -198,12 +198,33 @@ static void run_onesided(struct cfg *c) {
   vt_close_device(&v);
 }
 
+/* Busy-poll until *flag == expect, or timeout_us elapses. Returns 0 on hit. */
+static int wait_flag_eq(volatile uint8_t *flag, uint8_t expect, int timeout_us) {
+  uint64_t t0 = vt_ns();
+  uint64_t lim = (uint64_t)timeout_us * 1000ull;
+  while (*flag != expect) {
+    if ((vt_ns() - t0) > lim)
+      return -1;
+  }
+  return 0;
+}
+
 /*
  * ECHO: both sides UC WRITE + poll buf[0]. Matches ww-echo.
  * Client times full RTT; prints echo_rtt and echo_rtt/2 (paper Fig.2).
+ *
+ * RoCE UC can drop packets with no retry. Without a timeout the client
+ * busy-waits forever and collect_fig2 hangs. We:
+ *   - put a sequence in flag/payload[0] so late replies are ignored
+ *   - time out the flag poll and retransmit (timing only the successful try)
  */
 static void run_echo(struct cfg *c) {
   enum ibv_qp_type qpt = IBV_QPT_UC;
+  /* Per-try flag wait; well above ~3us RTT, short enough to recover fast. */
+  const int flag_timeout_us = 2000;
+  const int max_tries = 64;
+  int use_inl = (c->size <= VT_MAX_INLINE);
+
   struct vt_ctx v;
   vt_open_device(&v, c->dev, 1, c->gid_index);
   int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
@@ -230,34 +251,33 @@ static void run_echo(struct cfg *c) {
   struct ibv_wc wc;
 
   if (c->is_server) {
-    printf("fig2 echo server size=%d\n", c->size);
+    printf("fig2 echo server size=%d inline=%d\n", c->size, use_inl);
+    fflush(stdout);
     uint8_t *payload = v.buf + VT_CACHELINE;
     memset(payload, 1, (size_t)c->size);
+    static uint64_t nb;
     for (;;) {
-      while (*flag == 0) {
-        /* busy poll — paper unsignaled WRITE detection */
+      uint8_t seq;
+      /* Wait for a non-zero seq (client never uses 0 as seq). */
+      while ((seq = *flag) == 0) {
       }
       *flag = 0;
 
-      /* Respond with unsignaled+inline WRITE into client's flag+payload. */
       memset(&wr, 0, sizeof(wr));
       memset(&sge, 0, sizeof(sge));
       sge.addr = (uintptr_t)payload;
       sge.length = (uint32_t)c->size;
       sge.lkey = v.mr->lkey;
       wr.opcode = IBV_WR_RDMA_WRITE;
-      wr.send_flags = IBV_SEND_INLINE; /* unsignaled: no SIGNALED bit */
-      /* Occasionally signal to reclaim SQ (selective signaling). */
-      static uint64_t nb;
-      if (vt_should_signal(nb++, 64)) {
+      wr.send_flags = 0;
+      if (use_inl)
+        wr.send_flags |= IBV_SEND_INLINE;
+      if (vt_should_signal(nb++, 64))
         wr.send_flags |= IBV_SEND_SIGNALED;
-        /* fallthrough poll below */
-      }
       wr.sg_list = &sge;
       wr.num_sge = 1;
-      /* Write non-zero into client's flag byte first in payload layout:
-       * we write size bytes starting at remote.addr; put flag in first byte. */
-      payload[0] = 1;
+      /* Echo seq into client's flag byte (remote WRITE starts at remote.addr). */
+      payload[0] = seq;
       wr.wr.rdma.remote_addr = remote.addr;
       wr.wr.rdma.rkey = remote.rkey;
       struct ibv_send_wr *bad = NULL;
@@ -272,35 +292,59 @@ static void run_echo(struct cfg *c) {
   memset(req, 1, (size_t)c->size);
   double sum = 0, minv = 1e9, maxv = 0;
   int total = c->warmup + c->iters;
+  int retries = 0;
+  static uint64_t nb;
+  uint8_t seq_gen = 0;
+
   for (int i = 0; i < total; i++) {
-    *flag = 0;
-    req[0] = 1;
-    memset(&wr, 0, sizeof(wr));
-    memset(&sge, 0, sizeof(sge));
-    sge.addr = (uintptr_t)req;
-    sge.length = (uint32_t)c->size;
-    sge.lkey = v.mr->lkey;
-    wr.opcode = IBV_WR_RDMA_WRITE;
-    wr.send_flags = IBV_SEND_INLINE; /* unsignaled request */
-    static uint64_t nb;
-    int sig = vt_should_signal(nb++, 64);
-    if (sig)
-      wr.send_flags |= IBV_SEND_SIGNALED;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.wr.rdma.remote_addr = remote.addr;
-    wr.wr.rdma.rkey = remote.rkey;
+    int ok = 0;
+    uint64_t t0 = 0, t1 = 0;
 
-    uint64_t t0 = vt_ns();
-    struct ibv_send_wr *bad = NULL;
-    VT_CHECK(ibv_post_send(qp, &wr, &bad) == 0, "post");
-    if (sig)
-      vt_poll_cq_one(v.cq, &wc, 5000);
+    for (int try = 0; try < max_tries; try++) {
+      uint8_t seq = ++seq_gen;
+      if (seq == 0)
+        seq = ++seq_gen; /* never use 0 */
 
-    while (*flag == 0) {
+      *flag = 0;
+      req[0] = seq;
+
+      memset(&wr, 0, sizeof(wr));
+      memset(&sge, 0, sizeof(sge));
+      sge.addr = (uintptr_t)req;
+      sge.length = (uint32_t)c->size;
+      sge.lkey = v.mr->lkey;
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.send_flags = 0;
+      if (use_inl)
+        wr.send_flags |= IBV_SEND_INLINE;
+      int sig = vt_should_signal(nb++, 64);
+      if (sig)
+        wr.send_flags |= IBV_SEND_SIGNALED;
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+      wr.wr.rdma.remote_addr = remote.addr;
+      wr.wr.rdma.rkey = remote.rkey;
+
+      t0 = vt_ns();
+      struct ibv_send_wr *bad = NULL;
+      VT_CHECK(ibv_post_send(qp, &wr, &bad) == 0, "post");
+      if (sig)
+        VT_CHECK(vt_poll_cq_one(v.cq, &wc, 5000) == 0, "echo sig poll");
+
+      if (wait_flag_eq(flag, seq, flag_timeout_us) == 0) {
+        t1 = vt_ns();
+        *flag = 0;
+        ok = 1;
+        if (try > 0)
+          retries += try;
+        break;
+      }
+      /* Dropped on RoCE UC — clear any late reply and retransmit. */
+      *flag = 0;
     }
-    uint64_t t1 = vt_ns();
-    *flag = 0;
+
+    if (!ok)
+      VT_DIE("echo: no response after retries (UC loss on RoCE?)");
 
     if (i >= c->warmup) {
       double us = (t1 - t0) / 1000.0;
@@ -313,8 +357,8 @@ static void run_echo(struct cfg *c) {
   }
   double avg = sum / c->iters;
   printf("fig2 mode=echo size=%d  rtt_avg=%.3f us  rtt/2=%.3f us  "
-         "min_rtt=%.3f max_rtt=%.3f\n",
-         c->size, avg, avg / 2.0, minv, maxv);
+         "min_rtt=%.3f max_rtt=%.3f  retries=%d\n",
+         c->size, avg, avg / 2.0, minv, maxv, retries);
 
   ibv_destroy_qp(qp);
   vt_close_device(&v);

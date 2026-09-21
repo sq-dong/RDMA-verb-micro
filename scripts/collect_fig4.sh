@@ -8,9 +8,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 CSV="$RESULTS_DIR/fig4.csv"
+rm -f "$CSV"
 csv_header "$CSV" "curve,size,mops"
 
-SIZES=(2 8 16 32 64 128 192 256)
+# Paper Fig.4 x-axis: 0 64 128 192 256
+SIZES=(4 8 16 32 64 128 192 256)
 declare -a JOBS=(
   "WR-UC-INLINE|-m write_uc"
   "WRITE-UC|-m write_uc --no-inline"
@@ -64,3 +66,4 @@ done
 
 log "wrote $CSV"
 python3 "$SCRIPT_DIR/plot_paper_figs.py" --fig 4 --results-dir "$RESULTS_DIR"
+cleanup_logs "$RESULTS_DIR"
