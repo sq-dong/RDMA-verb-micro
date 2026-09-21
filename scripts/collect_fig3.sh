@@ -7,19 +7,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# shellcheck source=paper_config.sh
+source "$SCRIPT_DIR/paper_config.sh"
+paper_assert_inline_sync
 
 CSV="$RESULTS_DIR/fig3.csv"
 rm -f "$CSV"
 csv_header "$CSV" "curve,size,mops"
 
-# Paper Fig.3 x-axis: 4 8 16 32 64 128 256 512 1024
-SIZES=(4 8 16 32 64 128 256 512 1024)
-# Paper Fig.3 WRITE is not inlined (inline is Fig.2 WR-INLINE and Fig.4 outbound).
+SIZES=("${PAPER_SIZES_FULL[@]}")
+# Paper Fig.3 WRITE is DMA (not inlined). Inline is Fig.2 WR-INLINE / Fig.4 outbound.
 declare -a JOBS=(
   "WRITE-UC|--uc --no-inline"
   "WRITE-RC|--rc --no-inline"
   "READ-RC|--read --no-inline"
 )
+log "fig3 no-inline WRITE/READ; sizes=${SIZES[*]}"
 
 mapfile -t CLIENTS < <(client_hosts)
 log "fig3 clients: ${CLIENTS[*]}"
@@ -61,7 +64,7 @@ for job in "${JOBS[@]}"; do
       cdev=$(client_dev_for "$h")
       cgid=$(client_gid_for "$h")
       clt_log="${clt_logs[$ci]}"
-      clt_cmd="cd '$BENCH_DIR' && ./fig3_inbound -c -d $cdev -a $SRV_IP -p $port -x $cgid -l $size -t 64 -Q 64 -D 3 $flags"
+      clt_cmd="cd '$BENCH_DIR' && ./fig3_inbound -c -d $cdev -a $SRV_IP -p $port -x $cgid -l $size -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_TPUT_SEC $flags"
       # shellcheck disable=SC2086
       if [[ -z "$h" || "$h" == "local" || "$h" == "localhost" ]]; then
         bash -lc "$clt_cmd" >"$clt_log" 2>&1 &

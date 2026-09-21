@@ -9,14 +9,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# shellcheck source=paper_config.sh
+source "$SCRIPT_DIR/paper_config.sh"
+paper_assert_inline_sync
 
 CSV="$RESULTS_DIR/fig6.csv"
 rm -f "$CSV"
 csv_header "$CSV" "curve,n,mops"
 
-# Paper Fig.6 x-axis ticks: 0 4 8 12 16
-NQPS=(4 8 12 16)
-SIZE=32
+NQPS=("${PAPER_NQPS[@]}")
+SIZE=$PAPER_MSG_SIZE
+log "fig6 size=${SIZE}B inlined+unsignaled (paper); inline ceiling=${PAPER_INLINE_MAX}B"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -26,7 +29,7 @@ sleep 1
 PORT_BASE=18540
 idx=0
 
-# ---- Out-WRITE-UC fanout ----
+# ---- Out-WRITE-UC fanout (inline UC WRITE, paper caption) ----
 for n in "${NQPS[@]}"; do
   port=$((PORT_BASE + idx))
   idx=$((idx + 1))
@@ -35,11 +38,11 @@ for n in "${NQPS[@]}"; do
   pass_log="$RESULTS_DIR/fig6_pass_write_$n.log"
   req_log="$RESULTS_DIR/fig6_req_write_$n.log"
 
-  pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -q $n -l $SIZE -Q 4 -D 30"
+  pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
   pid=$(remote_bg "$CLT_HOST" "$pass_log" "$pass_cmd")
   sleep 1
 
-  req_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -q $n -l $SIZE -Q 4 -D 3"
+  req_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
   set +e
   remote "${SRV_HOST:-local}" "$req_cmd" | tee "$req_log"
   rc=${PIPESTATUS[0]}
@@ -55,21 +58,20 @@ for n in "${NQPS[@]}"; do
   append_csv "$CSV" "Out-WRITE-UC,$n,$mops"
 done
 
-# ---- Out-SEND-UD (one UD QP; should stay high as n increases) ----
-# Re-measure SEND-UD once per n for the x-axis alignment (same single-QP rate).
+# ---- Out-SEND-UD (inlined UD SEND; flat vs n) ----
 for n in "${NQPS[@]}"; do
   port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig6 Out-SEND-UD n=$n (single UD QP)"
+  log "fig6 Out-SEND-UD n=$n (single UD QP, inlined)"
 
   pass_log="$RESULTS_DIR/fig6_pass_send_$n.log"
   req_log="$RESULTS_DIR/fig6_req_send_$n.log"
 
-  pass_cmd="cd '$BENCH_DIR' && ./fig4_outbound -c -R -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m send_ud -l $SIZE -t 64 -Q 64 -D 30"
+  pass_cmd="cd '$BENCH_DIR' && ./fig4_outbound -c -R -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m send_ud -l $SIZE -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_PASSIVE_SEC"
   pid=$(remote_bg "$CLT_HOST" "$pass_log" "$pass_cmd")
   sleep 1
 
-  req_cmd="cd '$BENCH_DIR' && ./fig4_outbound -s -R -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -m send_ud -l $SIZE -t 64 -Q 64 -D 3"
+  req_cmd="cd '$BENCH_DIR' && ./fig4_outbound -s -R -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -m send_ud -l $SIZE -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_TPUT_SEC"
   set +e
   remote "${SRV_HOST:-local}" "$req_cmd" | tee "$req_log"
   rc=${PIPESTATUS[0]}
@@ -85,19 +87,18 @@ for n in "${NQPS[@]}"; do
   append_csv "$CSV" "Out-SEND-UD,$n,$mops"
 done
 
-# ---- In-WRITE-UC: client posts inbound WRITEs (fig3) once per n as x-label ----
-# With one physical client, fan-in is limited; still recorded for the plot slot.
+# ---- In-WRITE-UC: paper Fig.6 uses inlined UC WRITE (unlike Fig.3 DMA WRITE) ----
 for n in "${NQPS[@]}"; do
   port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig3-as In-WRITE-UC label_n=$n"
+  log "fig6 In-WRITE-UC label_n=$n (inlined ${SIZE}B UC)"
 
   srv_log="$RESULTS_DIR/fig6_in_srv_$n.log"
   clt_log="$RESULTS_DIR/fig6_in_clt_$n.log"
   srv_cmd="cd '$BENCH_DIR' && ./fig3_inbound -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -l $SIZE --uc"
   pid=$(remote_bg "${SRV_HOST:-local}" "$srv_log" "$srv_cmd")
   sleep 1
-  clt_cmd="cd '$BENCH_DIR' && ./fig3_inbound -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -l $SIZE -t 64 -Q 64 -D 3 --uc"
+  clt_cmd="cd '$BENCH_DIR' && ./fig3_inbound -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -l $SIZE -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_TPUT_SEC --uc"
   set +e
   remote "$CLT_HOST" "$clt_cmd" | tee "$clt_log"
   rc=${PIPESTATUS[0]}

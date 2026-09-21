@@ -6,19 +6,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# shellcheck source=paper_config.sh
+source "$SCRIPT_DIR/paper_config.sh"
+paper_assert_inline_sync
 
 CSV="$RESULTS_DIR/fig4.csv"
 rm -f "$CSV"
 csv_header "$CSV" "curve,size,mops"
 
-# Paper Fig.4 x-axis: 0 64 128 192 256
-SIZES=(4 8 16 32 64 128 192 256)
+SIZES=("${PAPER_SIZES_OUT[@]}")
 declare -a JOBS=(
   "WR-UC-INLINE|-m write_uc"
   "WRITE-UC|-m write_uc --no-inline"
   "READ-RC|-m read"
   "SEND-UD|-m send_ud"
 )
+log "fig4 inline ceiling=${PAPER_INLINE_MAX}B; WR-UC-INLINE/SEND-UD inline, WRITE-UC no-inline"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -31,8 +34,8 @@ for job in "${JOBS[@]}"; do
   curve="${job%%|*}"
   flags="${job#*|}"
   for size in "${SIZES[@]}"; do
-    # Inline curves only meaningful up to ~256B
-    if [[ "$curve" == "WR-UC-INLINE" && "$size" -gt 256 ]]; then
+    # Inline curves only within paper CX-3 max (PAPER_INLINE_MAX).
+    if [[ "$curve" == "WR-UC-INLINE" && "$size" -gt $PAPER_INLINE_MAX ]]; then
       continue
     fi
     port=$((PORT_BASE + idx))
@@ -43,11 +46,11 @@ for job in "${JOBS[@]}"; do
     req_log="$RESULTS_DIR/fig4_req_${curve}_${size}.log"
 
     # Passive client first, then requester on server (-R).
-    pass_cmd="cd '$BENCH_DIR' && ./fig4_outbound -c -R -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -l $size -t 64 -Q 64 -D 30 $flags"
+    pass_cmd="cd '$BENCH_DIR' && ./fig4_outbound -c -R -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -l $size -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_PASSIVE_SEC $flags"
     pid=$(remote_bg "$CLT_HOST" "$pass_log" "$pass_cmd")
     sleep 1
 
-    req_cmd="cd '$BENCH_DIR' && ./fig4_outbound -s -R -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -l $size -t 64 -Q 64 -D 3 $flags"
+    req_cmd="cd '$BENCH_DIR' && ./fig4_outbound -s -R -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -l $size -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_TPUT_SEC $flags"
     set +e
     remote "${SRV_HOST:-local}" "$req_cmd" | tee "$req_log"
     rc=${PIPESTATUS[0]}

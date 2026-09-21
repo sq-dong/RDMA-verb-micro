@@ -58,7 +58,7 @@
       VT_DIE(msg);                                                             \
   } while (0)
 
-#define VT_MAX_INLINE 256
+#define VT_MAX_INLINE 256 /* paper CX-3 max; keep == PAPER_INLINE_MAX (scripts/paper_config.sh) */
 #define VT_BUF_SIZE (2 * 1024 * 1024)
 #define VT_SQ_DEPTH 128
 #define VT_RQ_DEPTH 128

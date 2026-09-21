@@ -299,7 +299,8 @@ def plot_fig3(results: Path, demo: bool = False):
 
 def plot_fig4(results: Path, demo: bool = False):
     path = results / "fig4.csv"
-    measure = [4, 8, 16, 32, 64, 128, 192, 256]
+    # Denser than paper tick labels so CX-5 PIO / WQE-BB steps show; labels stay 0..256.
+    measure = [4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
     if demo and not path.exists():
         rows = []
         for size in measure:
@@ -311,9 +312,10 @@ def plot_fig4(results: Path, demo: bool = False):
         rows = _read_csv(path)
 
     series = _series(rows, "curve", "size", "mops")
+    # Prefer sizes present in CSV (supports old and new sweeps).
+    present = sorted({int(float(r["size"])) for r in rows}) if rows else measure
+    ticks_fig4_meas = present if present else measure
     fig, ax = plt.subplots(figsize=(5.2, 3.6))
-    # Equal-spaced categories matching measured sizes on 0..256 paper range
-    ticks_fig4_meas = [4, 8, 16, 32, 64, 128, 192, 256]
     for name in ("WR-UC-INLINE", "SEND-UD", "WRITE-UC", "READ-RC"):
         pts = series.get(name, [])
         _plot_equal_spaced(
@@ -387,9 +389,10 @@ def plot_fig5(results: Path, demo: bool = False):
 
 def plot_fig6(results: Path, demo: bool = False):
     path = results / "fig6.csv"
+    measure = [1, 2, 4, 6, 8, 10, 12, 14, 16]
     if demo and not path.exists():
         rows = []
-        for n in (4, 8, 12, 16):
+        for n in measure:
             rows.append({"curve": "In-WRITE-UC", "n": n, "mops": 30 - n * 0.2})
             rows.append(
                 {
@@ -403,8 +406,9 @@ def plot_fig6(results: Path, demo: bool = False):
         rows = _read_csv(path)
 
     series = _series(rows, "curve", "n", "mops")
+    present = sorted({int(float(r["n"])) for r in rows}) if rows else measure
+    ticks_n = present if present else measure
     fig, ax = plt.subplots(figsize=(5.2, 3.6))
-    ticks_n = [4, 8, 12, 16]
     for name in ("In-WRITE-UC", "Out-WRITE-UC", "Out-SEND-UD"):
         pts = series.get(name, [])
         _plot_equal_spaced(

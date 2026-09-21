@@ -7,18 +7,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# shellcheck source=paper_config.sh
+source "$SCRIPT_DIR/paper_config.sh"
+paper_assert_inline_sync
 
 CSV="$RESULTS_DIR/fig2.csv"
 rm -f "$CSV"
 csv_header "$CSV" "mode,size,avg_us,min_us,max_us,rtt_us,half_rtt_us"
 
-# Paper Fig.2 x-axis ticks: 4 8 16 32 64 128 256 512 1024
-#   WRITE / WR-INLINE / ECHO: 4..256  (WRITE curve in paper stops with inline range;
-#                                      WR-INLINE & ECHO cannot exceed inline max)
-#   READ: 4..1024
-SIZES_WRITE=(4 8 16 32 64 128 256 512 1024)
-SIZES_READ=(4 8 16 32 64 128 256 512 1024)
-SIZES_INLINE=(4 8 16 32 64 128 256)
+SIZES_WRITE=("${PAPER_SIZES_FULL[@]}")
+SIZES_READ=("${PAPER_SIZES_FULL[@]}")
+SIZES_INLINE=("${PAPER_SIZES_INLINE[@]}")
+log "fig2 inline ceiling=${PAPER_INLINE_MAX}B (paper CX-3); WRITE/READ no inline"
 
 run_one() {
   local mode=$1

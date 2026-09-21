@@ -6,29 +6,33 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# shellcheck source=paper_config.sh
+source "$SCRIPT_DIR/paper_config.sh"
+paper_assert_inline_sync
 
 CSV="$RESULTS_DIR/fig5.csv"
 rm -f "$CSV"
 csv_header "$CSV" "echo_type,opt,mops"
 
-SIZE=32
-WINDOW=32
-DURATION=3
+SIZE=$PAPER_MSG_SIZE
+WINDOW=$PAPER_ECHO_WINDOW
+DURATION=$PAPER_TPUT_SEC
+log "fig5 size=${SIZE}B window=$WINDOW (inline only on +inlined bars; ceiling=${PAPER_INLINE_MAX}B)"
 
 # echo_type|binary_mode|opt_name|extra_flags
 declare -a JOBS=(
   "SEND/SEND|ss|basic|--rc --no-inline -Q 1"
   "SEND/SEND|ss|+unreliable|--no-inline -Q 1"
-  "SEND/SEND|ss|+unsignalled|--no-inline -Q 64"
-  "SEND/SEND|ss|+inlined|-Q 64"
+  "SEND/SEND|ss|+unsignalled|--no-inline -Q $PAPER_UNSIG"
+  "SEND/SEND|ss|+inlined|-Q $PAPER_UNSIG"
   "WR/WR|ww|basic|--rc --no-inline -Q 1"
   "WR/WR|ww|+unreliable|--no-inline -Q 1"
-  "WR/WR|ww|+unsignalled|--no-inline -Q 64"
-  "WR/WR|ww|+inlined|-Q 64"
+  "WR/WR|ww|+unsignalled|--no-inline -Q $PAPER_UNSIG"
+  "WR/WR|ww|+inlined|-Q $PAPER_UNSIG"
   "WR/SEND|ws|basic|--rc --no-inline -Q 1"
   "WR/SEND|ws|+unreliable|--no-inline -Q 1"
-  "WR/SEND|ws|+unsignalled|--no-inline -Q 64"
-  "WR/SEND|ws|+inlined|-Q 64"
+  "WR/SEND|ws|+unsignalled|--no-inline -Q $PAPER_UNSIG"
+  "WR/SEND|ws|+inlined|-Q $PAPER_UNSIG"
 )
 
 sync_bins

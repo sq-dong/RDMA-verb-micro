@@ -46,13 +46,19 @@ Pick `-x` from `show_gids` for the RoCEv2 row that matches that IPv4 address.
 
 Payload sweeps follow the paper axis ticks:
 
-| Figure | X axis | Measured sizes |
-|--------|--------|----------------|
-| Fig. 2 | 4 … 1024 | WRITE / WR-INLINE / ECHO: `4..256`; READ: `4..1024` |
-| Fig. 3 | 4 … 1024 | all curves: `4 8 16 32 64 128 256 512 1024` |
-| Fig. 4 | 0 … 256 | `4 8 16 32 64 128 192 256` |
-| Fig. 5 | (bars) | fixed **32** bytes |
-| Fig. 6 | 0 … 16 processes | `n = 4 8 12 16` |
+| Figure | X axis | Measured sizes | Inline policy |
+|--------|--------|----------------|---------------|
+| Fig. 2 | 4 … 1024 | WRITE / READ: `4..1024`; WR-INLINE / ECHO: `4..256` | only WR-INLINE + ECHO |
+| Fig. 3 | 4 … 1024 | all: `4..1024` | **no** inline (DMA WRITE / READ) |
+| Fig. 4 | 0 … 256 | `4 8 16 32 48 64 96 128 160 192 224 256` | WR-UC-INLINE + SEND-UD; WRITE-UC no |
+| Fig. 5 | (bars) | fixed **32** bytes | only `+inlined` bars |
+| Fig. 6 | 0 … 16 processes | `n = 1 2 4 6 8 10 12 14 16`, payload **32** B | all inlined (paper caption) |
+
+Shared knobs live in `scripts/paper_config.sh` (`PAPER_INLINE_MAX=256` = paper CX-3
+limit, kept equal to `VT_MAX_INLINE` in `common.h`). ConnectX-5 can grant ≫256 B of
+HW inline; we **never** raise the soft ceiling to the NIC max, so Fig.2–6 stay in the
+paper's 256 B regime. Absolute Mops still differ (CX-5 RoCE vs CX-3 IB); compare
+curve *shape*.
 
 Each `collect_fig*.sh` writes CSV, plots PNG/PDF, then deletes `*.log` (keeps CSV and figures).
 
@@ -131,7 +137,7 @@ ConnectX-5 RoCE vs the paper's ConnectX-3 InfiniBand; compare curve *shape*.
 |------------|-----------|
 | UC | `fig3`: `--uc` / `--rc`; `fig4`: `-m write_uc`; echo WRITE path defaults to UC |
 | UD SEND | `fig4 -m send_ud`; `fig5 -m ws\|ss` |
-| inline | Fig.2 `write_inl` and Fig.4 small WRITE/SEND. Fig.3 WRITE/READ pass `--no-inline` |
+| inline | Soft ceiling **256 B** (`VT_MAX_INLINE` / `PAPER_INLINE_MAX`). Fig.2 `write_inl`+echo; Fig.4 WR-UC-INLINE/SEND-UD; Fig.5 `+inlined`; Fig.6 all. Fig.3 WRITE/READ and Fig.4 WRITE-UC: `--no-inline` |
 | unsignaled / selective signaling | `-Q` (signal once every Q WRs) |
 | outstanding window | `-t` (postlist) or `fig5 -w` |
 | ECHO/2 | `fig2 -m echo` prints `rtt` and `rtt/2` |
