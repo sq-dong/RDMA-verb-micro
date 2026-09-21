@@ -1,0 +1,6 @@
+*.o
+fig2_latency
+fig3_inbound
+fig4_outbound
+fig5_echo
+fig6_scale
