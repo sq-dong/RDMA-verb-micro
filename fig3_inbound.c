@@ -3,7 +3,8 @@
  *
  * Template: rdma_bench/rw-tput-receiver/main.cc
  *   - Server publishes QP and sleeps (passive).
- *   - Client posts WRITE/READ window with selective signaling + optional inline.
+ *   - Client posts a WRITE/READ window with selective signaling.
+ *     Paper Fig.3 WRITE is a non-inlined DMA WRITE (--no-inline).
  *   - One client thread <-> one server thread (paper Fig.3a).
  *
  * Direction: CLIENT is the requester (verbs land on the server RNIC).

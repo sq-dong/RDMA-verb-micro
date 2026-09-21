@@ -14,10 +14,11 @@ csv_header "$CSV" "curve,size,mops"
 
 # Paper Fig.3 x-axis: 4 8 16 32 64 128 256 512 1024
 SIZES=(4 8 16 32 64 128 256 512 1024)
+# Paper Fig.3 WRITE is not inlined (inline is Fig.2 WR-INLINE and Fig.4 outbound).
 declare -a JOBS=(
-  "WRITE-UC|--uc"
-  "WRITE-RC|--rc"
-  "READ-RC|--read"
+  "WRITE-UC|--uc --no-inline"
+  "WRITE-RC|--rc --no-inline"
+  "READ-RC|--read --no-inline"
 )
 
 mapfile -t CLIENTS < <(client_hosts)

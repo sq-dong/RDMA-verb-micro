@@ -126,6 +126,93 @@ static void post_one_recv(struct ibv_qp *qp, struct vt_ctx *v, uint64_t id) {
   VT_CHECK(ibv_post_recv(qp, &wr, &bad) == 0, "post_recv");
 }
 
+/* Both sides post RQ WRs before this returns, so the first UD SEND is not dropped. */
+static void tcp_ready(int fd, int is_server) {
+  char b = 1;
+  if (is_server) {
+    VT_CHECK(read(fd, &b, 1) == 1, "ready");
+    VT_CHECK(write(fd, &b, 1) == 1, "ready");
+  } else {
+    VT_CHECK(write(fd, &b, 1) == 1, "ready");
+    VT_CHECK(read(fd, &b, 1) == 1, "ready");
+  }
+}
+
+/*
+ * SEND and RECV share one CQ. A blind vt_poll_cq() will steal a RECV CQE,
+ * and the echo loop will steal the SEND CQE the next signal-wait expects.
+ * Either way the peer spins forever (what hung collect_fig5 on SEND/SEND).
+ * Count both kinds here and always stop at `deadline`.
+ */
+struct cq_credit {
+  uint64_t signaled;
+  uint64_t reaped;
+  int pending_recvs; /* RECVs observed while reaping a SEND; not dropped */
+};
+
+/* 1 = RECV (repost on rqp), 2 = SEND, 0 = deadline, -1 = error. */
+static int poll_progress(struct ibv_cq *cq, struct ibv_qp *rqp, struct vt_ctx *v,
+                         uint64_t deadline, struct cq_credit *cr) {
+  while (vt_ns() < deadline) {
+    struct ibv_wc wc;
+    int r = ibv_poll_cq(cq, 1, &wc);
+    if (r == 0)
+      continue;
+    if (r < 0)
+      return -1;
+    if (wc.status != IBV_WC_SUCCESS) {
+      fprintf(stderr, "CQE %s opcode=%u\n", ibv_wc_status_str(wc.status),
+              wc.opcode);
+      return -1;
+    }
+    if (wc.opcode & IBV_WC_RECV) {
+      if (rqp)
+        post_one_recv(rqp, v, wc.wr_id);
+      cr->pending_recvs++;
+      return 1;
+    }
+    cr->reaped++;
+    return 2;
+  }
+  return 0;
+}
+
+/* Reap one signaled SEND CQE, ignoring (and reposting) RECVs along the way.
+ * 0 = caught up or one SEND reaped, -1 = deadline/error with credit still owed.
+ */
+static int reap_send(struct ibv_cq *cq, struct ibv_qp *rqp, struct vt_ctx *v,
+                     uint64_t deadline, struct cq_credit *cr) {
+  if (cr->signaled <= cr->reaped)
+    return 0;
+  while (vt_ns() < deadline) {
+    int k = poll_progress(cq, rqp, v, deadline, cr);
+    if (k == 2)
+      return 0;
+    if (k == 1)
+      continue;
+    return -1;
+  }
+  return -1;
+}
+
+static int wait_recv(struct ibv_cq *cq, struct ibv_qp *rqp, struct vt_ctx *v,
+                     uint64_t deadline, struct cq_credit *cr) {
+  while (vt_ns() < deadline) {
+    if (cr->pending_recvs > 0) {
+      cr->pending_recvs--;
+      return 1;
+    }
+    int k = poll_progress(cq, rqp, v, deadline, cr);
+    if (k == 1) {
+      cr->pending_recvs--;
+      return 1;
+    }
+    if (k <= 0)
+      return k;
+  }
+  return 0;
+}
+
 /* -------- WRITE/WRITE ECHO (ww-echo) -------- */
 static void run_ww(struct cfg *c) {
   enum ibv_qp_type qpt = c->use_uc ? IBV_QPT_UC : IBV_QPT_RC;
@@ -142,9 +229,10 @@ static void run_ww(struct cfg *c) {
   int fd = c->is_server ? vt_tcp_listen(c->ip, c->port)
                         : vt_tcp_connect(c->ip, c->port);
   vt_tcp_exchange(fd, &local, &remote);
-  close(fd);
   vt_qp_to_rtr(&v, qp, &remote, qpt);
   vt_qp_to_rts(qp, psn);
+  tcp_ready(fd, c->is_server);
+  close(fd);
 
   volatile uint8_t *flag = v.buf;
   *flag = 0;
@@ -163,26 +251,38 @@ static void run_ww(struct cfg *c) {
   uint64_t nb_tx = 0, echos = 0;
   uint64_t t0 = vt_ns();
   uint64_t deadline = t0 + (uint64_t)c->duration * 1000000000ull;
+  struct cq_credit cr = {0};
 
+  /*
+   * Reap previously posted signaled SENDs before the next batch.
+   * Do not poll while the batch is still unposted: with -Q 1 every WR is
+   * signaled, and vt_poll_cq() inside the build loop waits forever for a
+   * CQE that has not been posted yet (hung WR/WR basic).
+   */
   if (c->is_server) {
     printf("fig5 ww server window=%d size=%d\n", c->window, c->size);
-    while (vt_ns() < deadline + 2000000000ull) {
+    fflush(stdout);
+    uint64_t lim = deadline + 2000000000ull;
+    while (vt_ns() < lim) {
       while (*flag == 0) {
-        if (vt_ns() >= deadline + 2000000000ull)
+        if (vt_ns() >= lim)
           goto done_ww;
       }
       *flag = 0;
+      while (cr.signaled > cr.reaped) {
+        if (reap_send(v.cq, NULL, &v, lim, &cr) != 0)
+          goto done_ww;
+      }
+      int batch_sig = 0;
       for (int w = 0; w < c->window; w++) {
+        int do_sig = vt_should_signal(nb_tx, c->unsig);
         memset(&wr[w], 0, sizeof(wr[w]));
         memset(&sgl[w], 0, sizeof(sgl[w]));
         wr[w].opcode = IBV_WR_RDMA_WRITE;
         wr[w].num_sge = 1;
         wr[w].next = (w == c->window - 1) ? NULL : &wr[w + 1];
         wr[w].sg_list = &sgl[w];
-        wr[w].send_flags =
-            vt_should_signal(nb_tx, c->unsig) ? IBV_SEND_SIGNALED : 0;
-        if (vt_should_signal(nb_tx, c->unsig) && nb_tx > 0)
-          vt_poll_cq(v.cq, 1);
+        wr[w].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= VT_MAX_INLINE)
           wr[w].send_flags |= IBV_SEND_INLINE;
         payload[0] = 1;
@@ -191,26 +291,33 @@ static void run_ww(struct cfg *c) {
         sgl[w].lkey = v.mr->lkey;
         wr[w].wr.rdma.remote_addr = remote.addr + (uint64_t)(stride * w);
         wr[w].wr.rdma.rkey = remote.rkey;
+        if (do_sig)
+          batch_sig++;
         nb_tx++;
       }
       VT_CHECK(ibv_post_send(qp, &wr[0], &bad) == 0, "post");
+      cr.signaled += (uint64_t)batch_sig;
       echos += (uint64_t)c->window;
     }
   } else {
     printf("fig5 ww client window=%d size=%d\n", c->window, c->size);
+    fflush(stdout);
     while (vt_ns() < deadline) {
       *flag = 0;
+      while (cr.signaled > cr.reaped) {
+        if (reap_send(v.cq, NULL, &v, deadline, &cr) != 0)
+          goto done_ww;
+      }
+      int batch_sig = 0;
       for (int w = 0; w < c->window; w++) {
+        int do_sig = vt_should_signal(nb_tx, c->unsig);
         memset(&wr[w], 0, sizeof(wr[w]));
         memset(&sgl[w], 0, sizeof(sgl[w]));
         wr[w].opcode = IBV_WR_RDMA_WRITE;
         wr[w].num_sge = 1;
         wr[w].next = (w == c->window - 1) ? NULL : &wr[w + 1];
         wr[w].sg_list = &sgl[w];
-        wr[w].send_flags =
-            vt_should_signal(nb_tx, c->unsig) ? IBV_SEND_SIGNALED : 0;
-        if (vt_should_signal(nb_tx, c->unsig) && nb_tx > 0)
-          vt_poll_cq(v.cq, 1);
+        wr[w].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= VT_MAX_INLINE)
           wr[w].send_flags |= IBV_SEND_INLINE;
         payload[0] = 1;
@@ -219,10 +326,15 @@ static void run_ww(struct cfg *c) {
         sgl[w].lkey = v.mr->lkey;
         wr[w].wr.rdma.remote_addr = remote.addr + (uint64_t)(stride * w);
         wr[w].wr.rdma.rkey = remote.rkey;
+        if (do_sig)
+          batch_sig++;
         nb_tx++;
       }
       VT_CHECK(ibv_post_send(qp, &wr[0], &bad) == 0, "post");
+      cr.signaled += (uint64_t)batch_sig;
       while (*flag == 0) {
+        if (vt_ns() >= deadline)
+          goto done_ww;
       }
       echos += (uint64_t)c->window;
     }
@@ -233,6 +345,7 @@ done_ww:
     double sec = (vt_ns() - t0) / 1e9;
     printf("fig5 ww ECHO: %.2f Mops (completed windows*%d)\n",
            echos / sec / 1e6, c->window);
+    fflush(stdout);
   }
   ibv_destroy_qp(qp);
   vt_close_device(&v);
@@ -271,7 +384,6 @@ static void run_ws(struct cfg *c) {
   /* Exchange connected then dgram endpoints (order fixed). */
   vt_tcp_exchange(fd, &clocal, &cremote);
   vt_tcp_exchange(fd, &dlocal, &dremote);
-  close(fd);
 
   vt_qp_to_rtr(&v, cqp, &cremote, conn_t);
   vt_qp_to_rts(cqp, cpsn);
@@ -297,22 +409,28 @@ static void run_ws(struct cfg *c) {
 
   if (c->is_server) {
     printf("fig5 ws server (WRITE poll + UD SEND)\n");
-    while (vt_ns() < deadline + 2000000000ull) {
+    fflush(stdout);
+    tcp_ready(fd, 1);
+    close(fd);
+    struct cq_credit cr = {0};
+    uint64_t srv_deadline = deadline + 2000000000ull;
+    while (vt_ns() < srv_deadline) {
       while (*flag == 0) {
-        if (vt_ns() >= deadline + 2000000000ull)
+        if (vt_ns() >= srv_deadline)
           goto done_ws;
       }
       *flag = 0;
+
+      int do_sig = vt_should_signal(nb_tx, c->unsig);
+      if (do_sig && reap_send(v.cq, NULL, &v, srv_deadline, &cr) != 0)
+        goto done_ws;
 
       memset(&wr, 0, sizeof(wr));
       memset(&sge, 0, sizeof(sge));
       wr.opcode = IBV_WR_SEND;
       wr.num_sge = 1;
       wr.sg_list = &sge;
-      wr.send_flags =
-          vt_should_signal(nb_tx, c->unsig) ? IBV_SEND_SIGNALED : 0;
-      if (vt_should_signal(nb_tx, c->unsig) && nb_tx > 0)
-        vt_poll_cq(v.cq, 1);
+      wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
       if (c->use_inline && c->size <= VT_MAX_INLINE)
         wr.send_flags |= IBV_SEND_INLINE;
       wr.wr.ud.ah = dvq.ah;
@@ -322,26 +440,33 @@ static void run_ws(struct cfg *c) {
       sge.length = (uint32_t)c->size;
       sge.lkey = v.mr->lkey;
       VT_CHECK(ibv_post_send(dqp, &wr, &bad) == 0, "ud send");
+      if (do_sig)
+        cr.signaled++;
       nb_tx++;
       echos++;
     }
   } else {
     printf("fig5 ws client (UC WRITE + UD RECV)\n");
+    fflush(stdout);
     for (int i = 0; i < VT_RQ_DEPTH / 2; i++)
       post_one_recv(dqp, &v, (uint64_t)i);
+    tcp_ready(fd, 0);
+    close(fd);
 
+    struct cq_credit cr = {0};
     while (vt_ns() < deadline) {
       *flag = 0;
       payload[0] = 1;
+      int do_sig = vt_should_signal(nb_tx, c->unsig);
+      if (do_sig && reap_send(v.cq, dqp, &v, deadline, &cr) != 0)
+        break;
+
       memset(&wr, 0, sizeof(wr));
       memset(&sge, 0, sizeof(sge));
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.num_sge = 1;
       wr.sg_list = &sge;
-      wr.send_flags =
-          vt_should_signal(nb_tx, c->unsig) ? IBV_SEND_SIGNALED : 0;
-      if (vt_should_signal(nb_tx, c->unsig) && nb_tx > 0)
-        vt_poll_cq(v.cq, 1);
+      wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
       if (c->use_inline && c->size <= VT_MAX_INLINE)
         wr.send_flags |= IBV_SEND_INLINE;
       sge.addr = (uintptr_t)payload;
@@ -350,29 +475,20 @@ static void run_ws(struct cfg *c) {
       wr.wr.rdma.remote_addr = cremote.addr;
       wr.wr.rdma.rkey = cremote.rkey;
       VT_CHECK(ibv_post_send(cqp, &wr, &bad) == 0, "write");
+      if (do_sig)
+        cr.signaled++;
       nb_tx++;
 
-      /* Wait for one UD RECV completion, then repost. */
-      struct ibv_wc wc;
-      for (;;) {
-        int r = ibv_poll_cq(v.cq, 1, &wc);
-        if (r == 1 && (wc.opcode & IBV_WC_RECV)) {
-          if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "recv %s\n", ibv_wc_status_str(wc.status));
-            exit(1);
-          }
-          post_one_recv(dqp, &v, wc.wr_id);
-          break;
-        }
-        if (r == 1 && wc.status != IBV_WC_SUCCESS) {
-          fprintf(stderr, "wc %s\n", ibv_wc_status_str(wc.status));
-          exit(1);
-        }
-      }
+      uint64_t slice = vt_ns() + 2000000ull;
+      if (slice > deadline)
+        slice = deadline;
+      if (wait_recv(v.cq, dqp, &v, slice, &cr) != 1)
+        continue;
       echos++;
     }
     double sec = (vt_ns() - t0) / 1e9;
     printf("fig5 ws ECHO: %.2f Mops\n", echos / sec / 1e6);
+    fflush(stdout);
   }
 
 done_ws:
@@ -396,7 +512,6 @@ static void run_ss(struct cfg *c) {
   int fd = c->is_server ? vt_tcp_listen(c->ip, c->port)
                         : vt_tcp_connect(c->ip, c->port);
   vt_tcp_exchange(fd, &local, &remote);
-  close(fd);
   vt_qp_to_rtr(&v, qp, &remote, IBV_QPT_UD);
   vt_qp_to_rts(qp, psn);
   struct vt_qp vq = {.qp = qp, .remote = remote};
@@ -404,6 +519,8 @@ static void run_ss(struct cfg *c) {
 
   for (int i = 0; i < VT_RQ_DEPTH / 2; i++)
     post_one_recv(qp, &v, (uint64_t)i);
+  tcp_ready(fd, c->is_server);
+  close(fd);
 
   uint8_t *payload = v.buf + VT_CACHELINE;
   memset(payload, 1, (size_t)c->size);
@@ -413,51 +530,24 @@ static void run_ss(struct cfg *c) {
   uint64_t t0 = vt_ns();
   uint64_t deadline = t0 + (uint64_t)c->duration * 1000000000ull;
 
+  struct cq_credit cr = {0};
+
   if (c->is_server) {
     printf("fig5 ss server\n");
-    while (vt_ns() < deadline + 2000000000ull) {
-      struct ibv_wc wc;
-      int r = ibv_poll_cq(v.cq, 1, &wc);
-      if (r != 1)
-        continue;
-      if (wc.status != IBV_WC_SUCCESS)
-        continue;
-      if (wc.opcode & IBV_WC_RECV) {
-        post_one_recv(qp, &v, wc.wr_id);
-        memset(&wr, 0, sizeof(wr));
-        memset(&sge, 0, sizeof(sge));
-        wr.opcode = IBV_WR_SEND;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags =
-            vt_should_signal(nb_tx, c->unsig) ? IBV_SEND_SIGNALED : 0;
-        if (vt_should_signal(nb_tx, c->unsig) && nb_tx > 0)
-          vt_poll_cq(v.cq, 1);
-        if (c->use_inline && c->size <= VT_MAX_INLINE)
-          wr.send_flags |= IBV_SEND_INLINE;
-        wr.wr.ud.ah = vq.ah;
-        wr.wr.ud.remote_qpn = remote.qpn;
-        wr.wr.ud.remote_qkey = 0x11111111;
-        sge.addr = (uintptr_t)payload;
-        sge.length = (uint32_t)c->size;
-        sge.lkey = v.mr->lkey;
-        VT_CHECK(ibv_post_send(qp, &wr, &bad) == 0, "send");
-        nb_tx++;
-        echos++;
-      }
-    }
-  } else {
-    printf("fig5 ss client\n");
-    while (vt_ns() < deadline) {
+    fflush(stdout);
+    uint64_t lim = deadline + 2000000000ull;
+    while (vt_ns() < lim) {
+      if (wait_recv(v.cq, qp, &v, lim, &cr) != 1)
+        break;
+      int do_sig = vt_should_signal(nb_tx, c->unsig);
+      if (do_sig && reap_send(v.cq, qp, &v, lim, &cr) != 0)
+        break;
       memset(&wr, 0, sizeof(wr));
       memset(&sge, 0, sizeof(sge));
       wr.opcode = IBV_WR_SEND;
       wr.sg_list = &sge;
       wr.num_sge = 1;
-      wr.send_flags =
-          vt_should_signal(nb_tx, c->unsig) ? IBV_SEND_SIGNALED : 0;
-      if (vt_should_signal(nb_tx, c->unsig) && nb_tx > 0)
-        vt_poll_cq(v.cq, 1);
+      wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
       if (c->use_inline && c->size <= VT_MAX_INLINE)
         wr.send_flags |= IBV_SEND_INLINE;
       wr.wr.ud.ah = vq.ah;
@@ -467,20 +557,53 @@ static void run_ss(struct cfg *c) {
       sge.length = (uint32_t)c->size;
       sge.lkey = v.mr->lkey;
       VT_CHECK(ibv_post_send(qp, &wr, &bad) == 0, "send");
+      if (do_sig)
+        cr.signaled++;
       nb_tx++;
-
-      for (;;) {
-        struct ibv_wc wc;
-        int r = ibv_poll_cq(v.cq, 1, &wc);
-        if (r == 1 && (wc.opcode & IBV_WC_RECV)) {
-          post_one_recv(qp, &v, wc.wr_id);
-          break;
-        }
-      }
       echos++;
     }
+  } else {
+    printf("fig5 ss client\n");
+    fflush(stdout);
+    int win = c->window > 0 ? c->window : 1;
+    if (win > 32)
+      win = 32;
+    while (vt_ns() < deadline) {
+      int posted = 0;
+      for (int w = 0; w < win && vt_ns() < deadline; w++) {
+        int do_sig = vt_should_signal(nb_tx, c->unsig);
+        if (do_sig && reap_send(v.cq, qp, &v, deadline, &cr) != 0)
+          goto ss_client_done;
+        memset(&wr, 0, sizeof(wr));
+        memset(&sge, 0, sizeof(sge));
+        wr.opcode = IBV_WR_SEND;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
+        if (c->use_inline && c->size <= VT_MAX_INLINE)
+          wr.send_flags |= IBV_SEND_INLINE;
+        wr.wr.ud.ah = vq.ah;
+        wr.wr.ud.remote_qpn = remote.qpn;
+        wr.wr.ud.remote_qkey = 0x11111111;
+        sge.addr = (uintptr_t)payload;
+        sge.length = (uint32_t)c->size;
+        sge.lkey = v.mr->lkey;
+        VT_CHECK(ibv_post_send(qp, &wr, &bad) == 0, "send");
+        if (do_sig)
+          cr.signaled++;
+        nb_tx++;
+        posted++;
+      }
+      for (int w = 0; w < posted; w++) {
+        if (wait_recv(v.cq, qp, &v, deadline, &cr) != 1)
+          goto ss_client_done;
+        echos++;
+      }
+    }
+  ss_client_done:
     double sec = (vt_ns() - t0) / 1e9;
     printf("fig5 ss ECHO: %.2f Mops\n", echos / sec / 1e6);
+    fflush(stdout);
   }
 
   if (vq.ah)

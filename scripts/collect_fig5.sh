@@ -51,15 +51,21 @@ for job in "${JOBS[@]}"; do
   pid=$(remote_bg "${SRV_HOST:-local}" "$srv_log" "$srv_cmd")
   sleep 1
 
-  clt_cmd="cd '$BENCH_DIR' && ./fig5_echo -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m $mode -l $SIZE -w $WINDOW -D $DURATION $flags"
+  # Client must return when -D expires. timeout is a backstop if a poll misses the deadline.
+  clt_cmd="cd '$BENCH_DIR' && timeout 30s ./fig5_echo -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m $mode -l $SIZE -w $WINDOW -D $DURATION $flags"
   set +e
   remote "$CLT_HOST" "$clt_cmd" | tee "$clt_log"
   rc=${PIPESTATUS[0]}
   set -e
   kill_pid "$pid"
   kill_bench "$SRV_HOST"
+  kill_bench "$CLT_HOST"
   sleep 0.5
 
+  if [[ $rc -eq 124 ]]; then
+    log "WARN timeout $etype $opt"
+    continue
+  fi
   [[ $rc -eq 0 ]] || { log "WARN fail $etype $opt"; continue; }
   line=$(grep -E '^fig5 .*ECHO:' "$clt_log" | tail -1 || true)
   mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')

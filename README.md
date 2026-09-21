@@ -56,7 +56,7 @@ Payload sweeps follow the paper axis ticks:
 
 Each `collect_fig*.sh` writes CSV, plots PNG/PDF, then deletes `*.log` (keeps CSV and figures).
 
-## 4. Automated collect + plot (paper-style figures)
+## 4. Automated collect and plot
 
 ```bash
 # Load cluster / RDMA settings (edit scripts/setup_machine.sh if IPs/GIDs change)
@@ -113,7 +113,7 @@ ConnectX-5 RoCE vs the paper's ConnectX-3 InfiniBand; compare curve *shape*.
 ./fig2_latency -c -d mlx5_3 -a 10.0.0.20 -p 18500 -x <gid> -n 10000 -l 64 -m write
 
 ./fig3_inbound -s -d mlx5_0 -a 10.0.0.20 -p 18510 -x 4
-./fig3_inbound -c -d mlx5_3 -a 10.0.0.20 -p 18510 -x <gid> -l 32 -t 64 -Q 64 --uc -D 5
+./fig3_inbound -c -d mlx5_3 -a 10.0.0.20 -p 18510 -x <gid> -l 32 -t 64 -Q 64 --uc --no-inline -D 5
 
 ./fig4_outbound -s -d mlx5_0 -a 10.0.0.20 -p 18520 -x 4 -R -l 32 -t 64 -Q 64 -m write_uc -D 5
 ./fig4_outbound -c -d mlx5_3 -a 10.0.0.20 -p 18520 -x <gid> -R -l 32 -t 64 -Q 64 -m write_uc -D 5
@@ -125,13 +125,13 @@ ConnectX-5 RoCE vs the paper's ConnectX-3 InfiniBand; compare curve *shape*.
 ./fig6_scale -c -d mlx5_3 -a 10.0.0.20 -p 18540 -x <gid> -q 16 -l 32 -D 5
 ```
 
-## 6. Paper knobs → program flags
+## 6. Paper knobs  program flags
 
 | Paper term | Flag here |
 |------------|-----------|
 | UC | `fig3`: `--uc` / `--rc`; `fig4`: `-m write_uc`; echo WRITE path defaults to UC |
 | UD SEND | `fig4 -m send_ud`; `fig5 -m ws\|ss` |
-| inline | Default `IBV_SEND_INLINE` for small payloads; disable with `--no-inline` |
+| inline | Fig.2 `write_inl` and Fig.4 small WRITE/SEND. Fig.3 WRITE/READ pass `--no-inline` |
 | unsignaled / selective signaling | `-Q` (signal once every Q WRs) |
 | outstanding window | `-t` (postlist) or `fig5 -w` |
 | ECHO/2 | `fig2 -m echo` prints `rtt` and `rtt/2` |
