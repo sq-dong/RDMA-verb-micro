@@ -21,7 +21,7 @@ declare -a JOBS=(
   "READ-RC|-m read"
   "SEND-UD|-m send_ud"
 )
-log "fig4 inline ceiling=${PAPER_INLINE_MAX}B; WR-UC-INLINE/SEND-UD inline, WRITE-UC no-inline"
+log "fig4 RC inline≤${PAPER_INLINE_MAX}B UD≤${PAPER_INLINE_MAX_UD}B; WRITE-UC no-inline"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -34,8 +34,11 @@ for job in "${JOBS[@]}"; do
   curve="${job%%|*}"
   flags="${job#*|}"
   for size in "${SIZES[@]}"; do
-    # Inline curves only within paper CX-3 max (PAPER_INLINE_MAX).
+    # Inline curves only up to this NIC's grant (RC/UC vs UD differ).
     if [[ "$curve" == "WR-UC-INLINE" && "$size" -gt $PAPER_INLINE_MAX ]]; then
+      continue
+    fi
+    if [[ "$curve" == "SEND-UD" && "$size" -gt $PAPER_INLINE_MAX_UD ]]; then
       continue
     fi
     port=$((PORT_BASE + idx))

@@ -44,21 +44,20 @@ to `-a`, never the management address (`192.168.100.x`).
 
 Pick `-x` from `show_gids` for the RoCEv2 row that matches that IPv4 address.
 
-Payload sweeps follow the paper axis ticks:
+Payload sweeps follow the **HW-native** axis on this CX-5 (old paper-256
+config is commented in `scripts/paper_config.sh` / `common.h`):
 
 | Figure | X axis | Measured sizes | Inline policy |
 |--------|--------|----------------|---------------|
-| Fig. 2 | 4 … 1024 | WRITE / READ: `4..1024`; WR-INLINE / ECHO: `4..256` | only WR-INLINE + ECHO |
-| Fig. 3 | 4 … 1024 | all: `4..1024` | **no** inline (DMA WRITE / READ) |
-| Fig. 4 | 0 … 256 | `4 8 16 32 48 64 96 128 160 192 224 256` | WR-UC-INLINE + SEND-UD; WRITE-UC no |
+| Fig. 2 | 4 … 4096 | WRITE / READ: `…4096`; WR-INLINE / ECHO: `…828` | only WR-INLINE + ECHO |
+| Fig. 3 | 4 … 4096 | all: through 4096 | **no** inline (DMA WRITE / READ) |
+| Fig. 4 | 4 … 4096 | dense to 828/956 then 1K/2K/4K | WR-UC-INLINE ≤828; SEND-UD ≤956; WRITE-UC no |
 | Fig. 5 | (bars) | fixed **32** bytes | only `+inlined` bars |
-| Fig. 6 | 0 … 16 processes | `n = 1 2 4 6 8 10 12 14 16`, payload **32** B | all inlined (paper caption) |
+| Fig. 6 | 0 … 16 processes | `n = 1 2 4 6 8 10 12 14 16`, payload **32** B | all inlined |
 
-Shared knobs live in `scripts/paper_config.sh` (`PAPER_INLINE_MAX=256` = paper CX-3
-limit, kept equal to `VT_MAX_INLINE` in `common.h`). ConnectX-5 can grant ≫256 B of
-HW inline; we **never** raise the soft ceiling to the NIC max, so Fig.2–6 stay in the
-paper's 256 B regime. Absolute Mops still differ (CX-5 RoCE vs CX-3 IB); compare
-curve *shape*.
+`PAPER_INLINE_MAX=828` / `VT_MAX_INLINE=828` = mlx5_0 RC/UC grant;
+`PAPER_INLINE_MAX_UD=956` / `VT_MAX_INLINE_UD=956` for UD. Absolute Mops still
+differ from the paper (RoCE vs IB); compare curve *shape* (inline cliff, BW fall-off).
 
 Each `collect_fig*.sh` writes CSV, plots PNG/PDF, then deletes `*.log` (keeps CSV and figures).
 
@@ -137,7 +136,7 @@ ConnectX-5 RoCE vs the paper's ConnectX-3 InfiniBand; compare curve *shape*.
 |------------|-----------|
 | UC | `fig3`: `--uc` / `--rc`; `fig4`: `-m write_uc`; echo WRITE path defaults to UC |
 | UD SEND | `fig4 -m send_ud`; `fig5 -m ws\|ss` |
-| inline | Soft ceiling **256 B** (`VT_MAX_INLINE` / `PAPER_INLINE_MAX`). Fig.2 `write_inl`+echo; Fig.4 WR-UC-INLINE/SEND-UD; Fig.5 `+inlined`; Fig.6 all. Fig.3 WRITE/READ and Fig.4 WRITE-UC: `--no-inline` |
+| inline | HW ceiling RC/UC **828 B**, UD **956 B**. Fig.2 `write_inl`+echo; Fig.4 WR-UC-INLINE/SEND-UD; Fig.5 `+inlined`; Fig.6 all. Fig.3 WRITE/READ and Fig.4 WRITE-UC: `--no-inline`. Old paper-256 soft cap is commented in `paper_config.sh` / `common.h` |
 | unsignaled / selective signaling | `-Q` (signal once every Q WRs) |
 | outstanding window | `-t` (postlist) or `fig5 -w` |
 | ECHO/2 | `fig2 -m echo` prints `rtt` and `rtt/2` |

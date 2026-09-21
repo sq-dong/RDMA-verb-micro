@@ -103,6 +103,13 @@ struct ibv_qp *vt_create_qp(struct vt_ctx *v, enum ibv_qp_type type,
   attr.cap.max_recv_wr = VT_RQ_DEPTH;
   attr.cap.max_send_sge = 1;
   attr.cap.max_recv_sge = 1;
+  /* Clamp to type max: RC/UC fail above ~828; UD can take ~956 on mlx5_0. */
+  if (type == IBV_QPT_UD) {
+    if (max_inline > VT_MAX_INLINE_UD)
+      max_inline = VT_MAX_INLINE_UD;
+  } else if (max_inline > VT_MAX_INLINE) {
+    max_inline = VT_MAX_INLINE;
+  }
   attr.cap.max_inline_data = (uint32_t)max_inline;
   struct ibv_qp *qp = ibv_create_qp(v->pd, &attr);
   VT_CHECK(qp, "ibv_create_qp");

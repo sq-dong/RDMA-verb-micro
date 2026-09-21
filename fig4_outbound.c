@@ -134,7 +134,8 @@ int main(int argc, char **argv) {
   int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                IBV_ACCESS_REMOTE_READ;
   vt_alloc_buf(&v, VT_BUF_SIZE, access);
-  struct ibv_qp *qp = vt_create_qp(&v, qpt, VT_MAX_INLINE);
+  int inl_cap = is_ud ? VT_MAX_INLINE_UD : VT_MAX_INLINE;
+  struct ibv_qp *qp = vt_create_qp(&v, qpt, inl_cap);
   uint32_t psn = (uint32_t)(vt_ns() & 0xffffff);
   struct vt_endpoint local, remote;
   vt_fill_local_ep(&v, qp, psn, &local);
@@ -208,7 +209,7 @@ int main(int argc, char **argv) {
           vt_should_signal(nb_tx, c.unsig) ? IBV_SEND_SIGNALED : 0;
       if (vt_should_signal(nb_tx, c.unsig) && nb_tx > 0)
         vt_poll_cq(v.cq, 1);
-      if (c.use_inline && !do_read && c.size <= VT_MAX_INLINE)
+      if (c.use_inline && !do_read && c.size <= inl_cap)
         wr[w].send_flags |= IBV_SEND_INLINE;
 
       sgl[w].addr = (uintptr_t)(v.buf + stride * w);

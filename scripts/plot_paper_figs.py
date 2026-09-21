@@ -2,10 +2,11 @@
 """
 Plot HERD Sec.3 Figures 2–6 from CSV under results/.
 
-Paper axis ticks (SIGCOMM'14 readable PDF):
-  Fig.2 / Fig.3: 4 8 16 32 64 128 256 512 1024
-  Fig.4:         0 64 128 192 256
-  Fig.6:         0 4 8 12 16  (process count)
+Current HW-native axis (CX-5 mlx5_0): payload through 4096; inline cliff ~828/956.
+Old paper ticks (kept for reference):
+  # Fig.2 / Fig.3: 4 8 16 32 64 128 256 512 1024
+  # Fig.4:         0 64 128 192 256
+  # Fig.6:         0 4 8 12 16
 
 Usage:
   python3 scripts/plot_paper_figs.py --fig all --results-dir results
@@ -40,11 +41,12 @@ STYLE = {
     "savefig.bbox": "tight",
 }
 
-# Paper Fig.2/3 payload ticks
-TICKS_FIG2_3 = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
-# Paper Fig.4 payload ticks
-TICKS_FIG4 = [0, 64, 128, 192, 256]
-# Paper Fig.6 process-count ticks
+# HW-native payload axis (CX-5); old paper ticks kept as comment only.
+# TICKS_FIG2_3 = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+DEFAULT_SIZES_FULL = [4, 8, 16, 32, 64, 128, 256, 512, 828, 1024, 2048, 4096]
+DEFAULT_SIZES_OUT = [
+    4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 320, 384, 512, 640, 768, 828, 1024, 2048, 4096
+]
 TICKS_FIG6 = [0, 4, 8, 12, 16]
 
 COLORS = {
@@ -146,24 +148,31 @@ def _save(fig, out_base: Path):
     print(f"wrote {out_base}.pdf / .png")
 
 
+def _x_ticks_from_rows(rows, field: str, fallback: list[int]) -> list[int]:
+    if not rows:
+        return list(fallback)
+    xs = sorted({int(float(r[field])) for r in rows if r.get(field) not in (None, "")})
+    return xs if xs else list(fallback)
+
+
 def plot_fig2(results: Path, demo: bool = False):
     path = results / "fig2.csv"
     if demo and not path.exists():
         rows = []
-        for size in TICKS_FIG2_3:
-            base = 1.8 + size / 400.0
-            if size <= 256:
-                rows.append(
-                    {
-                        "mode": "write",
-                        "size": size,
-                        "avg_us": base + 0.15,
-                        "min_us": 0,
-                        "max_us": 0,
-                        "rtt_us": "",
-                        "half_rtt_us": "",
-                    }
-                )
+        for size in DEFAULT_SIZES_FULL:
+            base = 1.8 + size / 800.0
+            rows.append(
+                {
+                    "mode": "write",
+                    "size": size,
+                    "avg_us": base + 0.15,
+                    "min_us": 0,
+                    "max_us": 0,
+                    "rtt_us": "",
+                    "half_rtt_us": "",
+                }
+            )
+            if size <= 828:
                 rows.append(
                     {
                         "mode": "write_inl",
@@ -211,6 +220,7 @@ def plot_fig2(results: Path, demo: bool = False):
     else:
         rows = _read_csv(path)
 
+    ticks = _x_ticks_from_rows(rows, "size", DEFAULT_SIZES_FULL)
     series = _series(rows, "mode", "size", "avg_us")
     echo_half = []
     echo_rtt = []
@@ -229,7 +239,7 @@ def plot_fig2(results: Path, demo: bool = False):
         _plot_equal_spaced(
             ax,
             pts,
-            TICKS_FIG2_3,
+            ticks,
             marker=MARKERS[mode],
             color=COLORS[mode],
             label=labels[mode],
@@ -239,7 +249,7 @@ def plot_fig2(results: Path, demo: bool = False):
         _plot_equal_spaced(
             ax,
             echo_rtt,
-            TICKS_FIG2_3,
+            ticks,
             marker="D",
             color=COLORS["echo"],
             label="ECHO",
@@ -249,7 +259,7 @@ def plot_fig2(results: Path, demo: bool = False):
         _plot_equal_spaced(
             ax,
             echo_half,
-            TICKS_FIG2_3,
+            ticks,
             marker="v",
             color=COLORS["echo_rtt"],
             label="ECHO / 2",
@@ -259,7 +269,7 @@ def plot_fig2(results: Path, demo: bool = False):
 
     ax.set_ylabel("Latency (µs)")
     ax.set_title("Figure 2: Latency of verbs and ECHO operations")
-    _finish_equal_x(ax, TICKS_FIG2_3, "Size of payload (bytes)")
+    _finish_equal_x(ax, ticks, "Size of payload (bytes)")
     ax.set_ylim(bottom=0)
     ax.legend(loc="best", frameon=True)
     _save(fig, results / "fig2_latency")
@@ -269,13 +279,14 @@ def plot_fig3(results: Path, demo: bool = False):
     path = results / "fig3.csv"
     if demo and not path.exists():
         rows = []
-        for size in TICKS_FIG2_3:
+        for size in DEFAULT_SIZES_FULL:
             rows.append({"curve": "WRITE-UC", "size": size, "mops": max(5, 35 - size / 40)})
             rows.append({"curve": "WRITE-RC", "size": size, "mops": max(4, 32 - size / 35)})
             rows.append({"curve": "READ-RC", "size": size, "mops": max(3, 26 - size / 50)})
     else:
         rows = _read_csv(path)
 
+    ticks = _x_ticks_from_rows(rows, "size", DEFAULT_SIZES_FULL)
     series = _series(rows, "curve", "size", "mops")
     fig, ax = plt.subplots(figsize=(5.2, 3.6))
     for name in ("WRITE-UC", "WRITE-RC", "READ-RC"):
@@ -283,7 +294,7 @@ def plot_fig3(results: Path, demo: bool = False):
         _plot_equal_spaced(
             ax,
             pts,
-            TICKS_FIG2_3,
+            ticks,
             marker=MARKERS.get(name, "o"),
             color=COLORS.get(name, None),
             label=name,
@@ -291,7 +302,7 @@ def plot_fig3(results: Path, demo: bool = False):
         )
     ax.set_ylabel("Throughput (Mops)")
     ax.set_title("Figure 3: Inbound verbs throughput")
-    _finish_equal_x(ax, TICKS_FIG2_3, "Size of payload (bytes)")
+    _finish_equal_x(ax, ticks, "Size of payload (bytes)")
     ax.set_ylim(bottom=0)
     ax.legend(loc="best")
     _save(fig, results / "fig3_inbound")
@@ -299,23 +310,21 @@ def plot_fig3(results: Path, demo: bool = False):
 
 def plot_fig4(results: Path, demo: bool = False):
     path = results / "fig4.csv"
-    # Denser than paper tick labels so CX-5 PIO / WQE-BB steps show; labels stay 0..256.
-    measure = [4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
+    measure = list(DEFAULT_SIZES_OUT)
     if demo and not path.exists():
         rows = []
         for size in measure:
-            rows.append({"curve": "WR-UC-INLINE", "size": size, "mops": max(8, 38 - size / 8)})
-            rows.append({"curve": "SEND-UD", "size": size, "mops": max(7, 36 - size / 7)})
+            if size <= 828:
+                rows.append({"curve": "WR-UC-INLINE", "size": size, "mops": max(8, 38 - size / 8)})
+                rows.append({"curve": "SEND-UD", "size": size, "mops": max(7, 36 - size / 7)})
             rows.append({"curve": "WRITE-UC", "size": size, "mops": max(6, 28 - size / 12)})
             rows.append({"curve": "READ-RC", "size": size, "mops": max(5, 22 - size / 30)})
     else:
         rows = _read_csv(path)
 
     series = _series(rows, "curve", "size", "mops")
-    # Prefer sizes present in CSV (supports old and new sweeps).
-    present = sorted({int(float(r["size"])) for r in rows}) if rows else measure
-    ticks_fig4_meas = present if present else measure
-    fig, ax = plt.subplots(figsize=(5.2, 3.6))
+    ticks_fig4_meas = _x_ticks_from_rows(rows, "size", measure)
+    fig, ax = plt.subplots(figsize=(5.8, 3.6))
     for name in ("WR-UC-INLINE", "SEND-UD", "WRITE-UC", "READ-RC"):
         pts = series.get(name, [])
         _plot_equal_spaced(

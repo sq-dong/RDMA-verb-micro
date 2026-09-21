@@ -18,7 +18,7 @@ csv_header "$CSV" "mode,size,avg_us,min_us,max_us,rtt_us,half_rtt_us"
 SIZES_WRITE=("${PAPER_SIZES_FULL[@]}")
 SIZES_READ=("${PAPER_SIZES_FULL[@]}")
 SIZES_INLINE=("${PAPER_SIZES_INLINE[@]}")
-log "fig2 inline ceiling=${PAPER_INLINE_MAX}B (paper CX-3); WRITE/READ no inline"
+  log "fig2 inline ceiling=${PAPER_INLINE_MAX}B (HW RC/UC); WRITE/READ no inline"
 
 run_one() {
   local mode=$1

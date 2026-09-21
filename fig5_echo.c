@@ -368,7 +368,7 @@ static void run_ws(struct cfg *c) {
   /* Connected QP for WRITE requests */
   struct ibv_qp *cqp = vt_create_qp(&v, conn_t, VT_MAX_INLINE);
   /* Datagram QP for SEND responses */
-  struct ibv_qp *dqp = vt_create_qp(&v, IBV_QPT_UD, VT_MAX_INLINE);
+  struct ibv_qp *dqp = vt_create_qp(&v, IBV_QPT_UD, VT_MAX_INLINE_UD);
 
   uint32_t cpsn = (uint32_t)(vt_ns() & 0xffffff);
   uint32_t dpsn = (uint32_t)((vt_ns() >> 8) & 0xffffff);
@@ -431,7 +431,7 @@ static void run_ws(struct cfg *c) {
       wr.num_sge = 1;
       wr.sg_list = &sge;
       wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-      if (c->use_inline && c->size <= VT_MAX_INLINE)
+      if (c->use_inline && c->size <= VT_MAX_INLINE_UD)
         wr.send_flags |= IBV_SEND_INLINE;
       wr.wr.ud.ah = dvq.ah;
       wr.wr.ud.remote_qpn = dremote.qpn;
@@ -504,7 +504,7 @@ static void run_ss(struct cfg *c) {
   struct vt_ctx v;
   vt_open_device(&v, c->dev, 1, c->gid_index);
   vt_alloc_buf(&v, VT_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
-  struct ibv_qp *qp = vt_create_qp(&v, IBV_QPT_UD, VT_MAX_INLINE);
+  struct ibv_qp *qp = vt_create_qp(&v, IBV_QPT_UD, VT_MAX_INLINE_UD);
   uint32_t psn = (uint32_t)(vt_ns() & 0xffffff);
   struct vt_endpoint local, remote;
   vt_fill_local_ep(&v, qp, psn, &local);
@@ -548,7 +548,7 @@ static void run_ss(struct cfg *c) {
       wr.sg_list = &sge;
       wr.num_sge = 1;
       wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-      if (c->use_inline && c->size <= VT_MAX_INLINE)
+      if (c->use_inline && c->size <= VT_MAX_INLINE_UD)
         wr.send_flags |= IBV_SEND_INLINE;
       wr.wr.ud.ah = vq.ah;
       wr.wr.ud.remote_qpn = remote.qpn;
@@ -580,7 +580,7 @@ static void run_ss(struct cfg *c) {
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-        if (c->use_inline && c->size <= VT_MAX_INLINE)
+        if (c->use_inline && c->size <= VT_MAX_INLINE_UD)
           wr.send_flags |= IBV_SEND_INLINE;
         wr.wr.ud.ah = vq.ah;
         wr.wr.ud.remote_qpn = remote.qpn;

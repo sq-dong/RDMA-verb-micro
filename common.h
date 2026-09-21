@@ -58,7 +58,14 @@
       VT_DIE(msg);                                                             \
   } while (0)
 
-#define VT_MAX_INLINE 256 /* paper CX-3 max; keep == PAPER_INLINE_MAX (scripts/paper_config.sh) */
+/* Soft inline ceiling for RC/UC (= mlx5_0 ibv_create_qp grant).
+ * Must match PAPER_INLINE_MAX in scripts/paper_config.sh.
+ * OLD paper CX-3 soft cap was 256 (restore by setting VT_MAX_INLINE and
+ * PAPER_INLINE_MAX back to 256; see commented blocks in paper_config.sh).
+ */
+#define VT_MAX_INLINE 828
+/* UD grant on same NIC (create UD QPs with this; do not use for RC/UC). */
+#define VT_MAX_INLINE_UD 956
 #define VT_BUF_SIZE (2 * 1024 * 1024)
 #define VT_SQ_DEPTH 128
 #define VT_RQ_DEPTH 128
