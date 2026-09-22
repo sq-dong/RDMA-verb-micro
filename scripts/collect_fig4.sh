@@ -49,11 +49,11 @@ for job in "${JOBS[@]}"; do
     req_log="$RESULTS_DIR/fig4_req_${curve}_${size}.log"
 
     # Passive client first, then requester on server (-R).
-    pass_cmd="cd '$BENCH_DIR' && ./fig4_outbound -c -R -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -l $size -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_PASSIVE_SEC $flags"
+    pass_cmd="cd '$BENCH_DIR' && ./fig4_outbound -c -R -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -l $size -t $PAPER_POSTLIST -Q $PAPER_UNSIG -q $PAPER_FIG4_NQPS -D $PAPER_PASSIVE_SEC $flags"
     pid=$(remote_bg "$CLT_HOST" "$pass_log" "$pass_cmd")
     sleep 1
 
-    req_cmd="cd '$BENCH_DIR' && ./fig4_outbound -s -R -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -l $size -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_TPUT_SEC $flags"
+    req_cmd="cd '$BENCH_DIR' && ./fig4_outbound -s -R -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -l $size -t $PAPER_POSTLIST -Q $PAPER_UNSIG -q $PAPER_FIG4_NQPS -D $PAPER_TPUT_SEC $flags"
     set +e
     remote "${SRV_HOST:-local}" "$req_cmd" | tee "$req_log"
     rc=${PIPESTATUS[0]}

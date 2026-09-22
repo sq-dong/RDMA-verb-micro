@@ -1,14 +1,16 @@
 /*
  * fig6_scale.c — HERD Sec.3 Fig.6: UC WRITE / UD SEND vs all-to-all size.
  *
- * Paper: N client + N server processes, all-to-all ⇒ N² QPs at RNICS.
- * collect_fig6.sh passes -q N*N and labels the CSV with paper N.
- * Out-SEND-UD keeps 1 QP (datagram one-to-many).
+ * Paper Sec.3.3 / Fig.6 caption: inlined + unsignaled; x-axis = N
+ * (#client procs = #server procs). All-to-all ⇒ N² connected QPs at RNICS.
  *
- * -t POSTLIST: post a batch to one randomly chosen QP per doorbell so low-N
- * is not doorbell-capped at ~5 Mops on CX-5 RoCE (paper used CX-3 IB).
+ * -q is always paper N. Local QP counts:
+ *   Out-WRITE: both sides N² (requester cache stress)
+ *   In-WRITE:  requester N, responder N² (only N connected to peer;
+ *              remaining responder QPs self-paired to RTS so contexts exist)
+ *   Out-SEND:  sender 1 UD QP + N AHs; passive N UD QPs
  *
- * Template: rdma_bench/sender-scalability/main.cc
+ * Templates: sender-scalability (WRITE), ud-sender (SEND).
  */
 
 #include "common.h"
@@ -28,7 +30,7 @@ struct cfg {
   uint16_t port;
   int gid_index;
   int size;
-  int nqp;
+  int nqp; /* paper N */
   int unsig;
   int postlist;
   int duration;
@@ -40,10 +42,10 @@ struct cfg {
 static void usage(const char *a) {
   fprintf(stderr,
           "Usage: %s -s|-c -d DEV -a IP [-p PORT] [-M out-write|in-write|"
-          "out-send-ud] [-q NQPS] [-t POSTLIST] [-l SIZE] [-Q UNSIG] [-D SEC] "
+          "out-send-ud] [-q PAPER_N] [-t POSTLIST] [-l SIZE] [-Q UNSIG] [-D SEC] "
           "[--no-inline] [--rc]\n"
-          "  -q : #QPs on this NIC (paper all-to-all N ⇒ N*N QPs).\n"
-          "  -t : postlist to one randomly chosen QP (doorbell amortize).\n",
+          "  -q : paper N (#procs). QP counts derived per mode (see file header).\n"
+          "  -t : postlist (paper Fig.6 uses 1 / nearly-unsignaled).\n",
           a);
   exit(1);
 }
@@ -67,7 +69,7 @@ static void parse(int argc, char **argv, struct cfg *c) {
   c->size = 32;
   c->nqp = 16;
   c->unsig = 4;
-  c->postlist = 64;
+  c->postlist = 1;
   c->duration = 5;
   c->use_inline = 1;
   c->use_uc = 1;
@@ -129,7 +131,7 @@ static void parse(int argc, char **argv, struct cfg *c) {
   if (c->is_server < 0 || !c->dev || !c->ip)
     usage(argv[0]);
   if (c->nqp < 1 || c->nqp > VT_MAX_QPS) {
-    fprintf(stderr, "nqp must be 1..%d\n", VT_MAX_QPS);
+    fprintf(stderr, "paper N (-q) must be 1..%d\n", VT_MAX_QPS);
     exit(1);
   }
   if (c->unsig < 1)
@@ -140,19 +142,23 @@ static void parse(int argc, char **argv, struct cfg *c) {
     c->postlist = 64;
 }
 
-static struct ibv_qp *create_qp_on_cq(struct vt_ctx *v, struct ibv_cq *cq,
-                                      enum ibv_qp_type type, int max_inline) {
-  /* Deep SQ so N=1 can also keep enough outstanding to reach peak rate
-   * (paper Fig.6 low-N should match Fig.4 outbound peak). */
-  const int sq_depth = 1024;
-  const int rq_depth = 512;
+static int clamp_nn(int n) {
+  int q = n * n;
+  if (q > VT_MAX_QPS)
+    q = VT_MAX_QPS;
+  return q;
+}
+
+static struct ibv_qp *create_qp(struct vt_ctx *v, struct ibv_cq *scq,
+                                struct ibv_cq *rcq, enum ibv_qp_type type,
+                                int max_inline, int sq_depth, int rq_depth) {
   struct ibv_qp_init_attr attr;
   memset(&attr, 0, sizeof(attr));
-  attr.send_cq = cq;
-  attr.recv_cq = cq;
+  attr.send_cq = scq;
+  attr.recv_cq = rcq;
   attr.qp_type = type;
-  attr.cap.max_send_wr = sq_depth;
-  attr.cap.max_recv_wr = rq_depth;
+  attr.cap.max_send_wr = (uint32_t)sq_depth;
+  attr.cap.max_recv_wr = (uint32_t)rq_depth;
   attr.cap.max_send_sge = 1;
   attr.cap.max_recv_sge = 1;
   if (type == IBV_QPT_UD) {
@@ -197,17 +203,67 @@ static int i_am_sender(const struct cfg *c) {
   return 0;
 }
 
+static struct ibv_ah *make_ah(struct vt_ctx *v,
+                              const struct vt_endpoint *remote) {
+  struct ibv_ah_attr ah_attr;
+  memset(&ah_attr, 0, sizeof(ah_attr));
+  ah_attr.port_num = (uint8_t)v->port;
+  ah_attr.sl = 0;
+  ah_attr.src_path_bits = 0;
+  if (v->is_roce || remote->is_roce) {
+    ah_attr.is_global = 1;
+    ah_attr.dlid = 0;
+    memcpy(ah_attr.grh.dgid.raw, remote->gid, 16);
+    ah_attr.grh.sgid_index = (uint8_t)v->gid_index;
+    ah_attr.grh.hop_limit = 1;
+  } else {
+    ah_attr.is_global = 0;
+    ah_attr.dlid = (uint16_t)remote->lid;
+  }
+  struct ibv_ah *ah = ibv_create_ah(v->pd, &ah_attr);
+  VT_CHECK(ah, "ibv_create_ah");
+  return ah;
+}
+
 int main(int argc, char **argv) {
   struct cfg c;
   parse(argc, argv, &c);
 
   const int is_ud = (c.mode == FIG6_OUT_SEND_UD);
-  const int n_local = is_ud ? 1 : c.nqp;
-  const int n_exch = n_local;
+  const int is_in = (c.mode == FIG6_IN_WRITE);
+  const int sender = i_am_sender(&c);
+  const int paper_n = c.nqp;
+  const int nn = clamp_nn(paper_n);
+
+  int n_local, n_exch, n_active, n_ah;
+  if (is_ud) {
+    n_ah = paper_n;
+    n_local = sender ? 1 : paper_n;
+    n_exch = paper_n;
+    n_active = 1;
+  } else if (is_in) {
+    n_local = sender ? paper_n : nn;
+    n_exch = paper_n;
+    n_active = paper_n;
+    n_ah = 0;
+  } else {
+    n_local = nn;
+    n_exch = nn;
+    n_active = nn;
+    n_ah = 0;
+  }
 
   enum ibv_qp_type qpt =
       is_ud ? IBV_QPT_UD : (c.use_uc ? IBV_QPT_UC : IBV_QPT_RC);
   const int inl_cap = vt_inline_grant(c.size, c.use_inline, is_ud);
+  const int sq_depth = 1024;
+  const int rq_depth = is_ud ? 512 : 16;
+
+  int unsig = c.unsig;
+  if (unsig > 1 && unsig < 2 * c.postlist)
+    unsig = 2 * c.postlist;
+  if (unsig > sq_depth / 2)
+    unsig = sq_depth / 2;
 
   struct vt_ctx v;
   vt_open_device(&v, c.dev, 1, c.gid_index);
@@ -215,19 +271,27 @@ int main(int argc, char **argv) {
                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                    IBV_ACCESS_REMOTE_READ);
 
-  struct ibv_cq *cqs[VT_MAX_QPS];
+  struct ibv_cq *scqs[VT_MAX_QPS];
+  struct ibv_cq *rcqs[VT_MAX_QPS];
   struct ibv_qp *qps[VT_MAX_QPS];
   struct vt_endpoint locals[VT_MAX_QPS], remotes[VT_MAX_QPS];
   struct ibv_ah *ahs[VT_MAX_QPS];
   uint32_t psns[VT_MAX_QPS];
   memset(ahs, 0, sizeof(ahs));
-  memset(cqs, 0, sizeof(cqs));
+  memset(scqs, 0, sizeof(scqs));
+  memset(rcqs, 0, sizeof(rcqs));
 
   for (int i = 0; i < n_local; i++) {
-    /* CQ must hold many signaled completions with deep SQ + unsig batch. */
-    cqs[i] = ibv_create_cq(v.ctx, 4096, NULL, NULL, 0);
-    VT_CHECK(cqs[i], "ibv_create_cq");
-    qps[i] = create_qp_on_cq(&v, cqs[i], qpt, inl_cap);
+    scqs[i] = ibv_create_cq(v.ctx, 4096, NULL, NULL, 0);
+    VT_CHECK(scqs[i], "scq");
+    if (is_ud) {
+      rcqs[i] = ibv_create_cq(v.ctx, 4096, NULL, NULL, 0);
+      VT_CHECK(rcqs[i], "rcq");
+    } else {
+      rcqs[i] = scqs[i];
+    }
+    qps[i] = create_qp(&v, scqs[i], rcqs[i], qpt, inl_cap, sq_depth,
+                       is_ud ? rq_depth : 16);
     psns[i] = (uint32_t)((vt_ns() + (uint64_t)i * 9973) & 0xffffff);
     vt_fill_local_ep(&v, qps[i], psns[i], &locals[i]);
     locals[i].addr = (uint64_t)(uintptr_t)(v.buf + (size_t)i * 4096);
@@ -236,36 +300,67 @@ int main(int argc, char **argv) {
 
   int fd = c.is_server ? vt_tcp_listen(c.ip, c.port)
                        : vt_tcp_connect(c.ip, c.port);
-  for (int i = 0; i < n_exch; i++)
-    vt_tcp_exchange(fd, &locals[i], &remotes[i]);
+
+  if (is_ud) {
+    for (int i = 0; i < n_exch; i++) {
+      if (sender)
+        vt_tcp_exchange(fd, &locals[0], &remotes[i]);
+      else
+        vt_tcp_exchange(fd, &locals[i], &remotes[0]);
+    }
+  } else {
+    for (int i = 0; i < n_exch; i++)
+      vt_tcp_exchange(fd, &locals[i], &remotes[i]);
+  }
   close(fd);
 
-  for (int i = 0; i < n_local; i++) {
-    vt_qp_to_rtr(&v, qps[i], &remotes[i], qpt);
+  for (int i = 0; i < n_exch && i < n_local; i++) {
+    const struct vt_endpoint *r = &remotes[i];
+    if (is_ud)
+      r = sender ? &remotes[0] : &remotes[0];
+    vt_qp_to_rtr(&v, qps[i], r, qpt);
     vt_qp_to_rts(qps[i], psns[i]);
-    if (is_ud) {
-      struct vt_qp vq = {.qp = qps[i], .remote = remotes[i]};
-      vt_create_ud_ah(&v, &vq);
-      ahs[i] = vq.ah;
+  }
+
+  /* In-WRITE responder: self-pair leftover QPs so N² contexts reach RTS. */
+  if (is_in && !sender && n_local > n_exch) {
+    for (int i = n_exch; i < n_local; i++) {
+      int peer = n_exch + ((i - n_exch) ^ 1);
+      if (peer >= n_local)
+        peer = n_exch;
+      if (peer == i)
+        peer = (i + 1 < n_local) ? i + 1 : n_exch;
+      vt_qp_to_rtr(&v, qps[i], &locals[peer], qpt);
+      vt_qp_to_rts(qps[i], psns[i]);
     }
   }
 
-  if (!i_am_sender(&c)) {
-    printf("fig6 passive nqp=%d mode=%d\n", n_local, (int)c.mode);
+  if (is_ud && sender) {
+    for (int i = 0; i < n_ah; i++)
+      ahs[i] = make_ah(&v, &remotes[i]);
+  }
+
+  if (!sender) {
+    printf("fig6 passive paper_N=%d nqp=%d mode=%d\n", paper_n, n_local,
+           (int)c.mode);
     fflush(stdout);
     if (is_ud) {
-      for (int r = 0; r < VT_RQ_DEPTH / 2; r++)
-        ud_post_recv(qps[0], &v, (uint64_t)r);
+      for (int qi = 0; qi < n_local; qi++) {
+        for (int r = 0; r < rq_depth / 2; r++)
+          ud_post_recv(qps[qi], &v, (uint64_t)((qi << 16) | r));
+      }
       for (;;) {
-        struct ibv_wc wc[16];
-        int n = ibv_poll_cq(cqs[0], 16, wc);
-        for (int i = 0; i < n; i++) {
-          if (wc[i].status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "wc %s\n", ibv_wc_status_str(wc[i].status));
-            exit(1);
+        for (int qi = 0; qi < n_local; qi++) {
+          struct ibv_wc wc[16];
+          int n = ibv_poll_cq(rcqs[qi], 16, wc);
+          for (int i = 0; i < n; i++) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+              fprintf(stderr, "wc %s\n", ibv_wc_status_str(wc[i].status));
+              exit(1);
+            }
+            if (wc[i].opcode & IBV_WC_RECV)
+              ud_post_recv(qps[qi], &v, wc[i].wr_id);
           }
-          if (wc[i].opcode & IBV_WC_RECV)
-            ud_post_recv(qps[0], &v, wc[i].wr_id);
         }
       }
     }
@@ -274,25 +369,20 @@ int main(int argc, char **argv) {
   }
 
   memset(v.buf, 1, VT_BUF_SIZE);
-  /*
-   * Paper Fig.6 / sender-scalability posts one WR at a time. On CX-5 RoCE that
-   * doorbell-limits us to ~5 Mops for EVERY curve, hiding QP-cache thrashing.
-   * We post a postlist to one randomly chosen QP per doorbell: low-N stays
-   * near fig4 rates; high-N still switches QPs and stresses the NIC cache.
-   */
+
   const int pl = c.postlist;
   struct ibv_send_wr wr[64], *bad;
   struct ibv_sge sge[64];
-  uint64_t nb_tx[VT_MAX_QPS];
-  uint64_t sig_posted[VT_MAX_QPS], sig_reaped[VT_MAX_QPS];
-  memset(nb_tx, 0, sizeof(nb_tx));
-  memset(sig_posted, 0, sizeof(sig_posted));
-  memset(sig_reaped, 0, sizeof(sig_reaped));
+  uint64_t nb_tx = 0;
+  uint64_t nb_tx_qp[VT_MAX_QPS];
+  memset(nb_tx_qp, 0, sizeof(nb_tx_qp));
   uint64_t ops = 0;
   uint64_t seed = 0x12345678abcdefull;
 
-  printf("fig6 sender nqp=%d size=%d inl=%d postlist=%d\n", n_local, c.size,
-         inl_cap, pl);
+  printf("fig6 sender paper_N=%d nqp=%d ndest=%d size=%d inl=%d postlist=%d "
+         "unsig=%d\n",
+         paper_n, n_active, is_ud ? n_ah : n_active, c.size, inl_cap, pl,
+         unsig);
   fflush(stdout);
 
   const uint64_t check_every = 65536;
@@ -305,71 +395,90 @@ int main(int argc, char **argv) {
         break;
     }
 
-    seed ^= seed << 13;
-    seed ^= seed >> 7;
-    seed ^= seed << 17;
-    int qi = is_ud ? 0 : (int)(seed % (uint64_t)n_local);
-
-    /*
-     * Keep several signaled WRs in flight (do not drain to zero every
-     * batch).  Otherwise N=1 is capped far below multi-QP runs that
-     * naturally keep work queued across QPs.
-     */
-    const uint64_t max_sig_inflight = 8;
-    while (sig_posted[qi] - sig_reaped[qi] >= max_sig_inflight) {
-      poll_one(cqs[qi]);
-      sig_reaped[qi]++;
-    }
-
-    for (int w = 0; w < pl; w++) {
-      memset(&wr[w], 0, sizeof(wr[w]));
-      memset(&sge[w], 0, sizeof(sge[w]));
-      wr[w].num_sge = 1;
-      wr[w].sg_list = &sge[w];
-      wr[w].next = (w == pl - 1) ? NULL : &wr[w + 1];
-      int do_sig = (nb_tx[qi] % (uint64_t)c.unsig == 0);
-      wr[w].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-      if (c.use_inline && c.size <= inl_cap)
-        wr[w].send_flags |= IBV_SEND_INLINE;
-      sge[w].addr = (uintptr_t)v.buf;
-      sge[w].length = (uint32_t)c.size;
-      sge[w].lkey = v.mr->lkey;
-      if (is_ud) {
+    if (is_ud) {
+      for (int w = 0; w < pl; w++) {
+        int cn = (int)(nb_tx % (uint64_t)n_ah);
+        memset(&wr[w], 0, sizeof(wr[w]));
+        memset(&sge[w], 0, sizeof(sge[w]));
         wr[w].opcode = IBV_WR_SEND;
-        wr[w].wr.ud.ah = ahs[0];
-        wr[w].wr.ud.remote_qpn = remotes[0].qpn;
+        wr[w].num_sge = 1;
+        wr[w].sg_list = &sge[w];
+        wr[w].next = (w == pl - 1) ? NULL : &wr[w + 1];
+        wr[w].wr.ud.ah = ahs[cn];
+        wr[w].wr.ud.remote_qpn = remotes[cn].qpn;
         wr[w].wr.ud.remote_qkey = 0x11111111;
-      } else {
+
+        int do_sig = (nb_tx % (uint64_t)unsig == 0);
+        wr[w].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
+        if (nb_tx >= (uint64_t)unsig &&
+            (nb_tx % (uint64_t)unsig == (uint64_t)unsig - 1))
+          poll_one(scqs[0]);
+        if (c.use_inline && c.size <= inl_cap)
+          wr[w].send_flags |= IBV_SEND_INLINE;
+
+        sge[w].addr = (uintptr_t)v.buf;
+        sge[w].length = (uint32_t)c.size;
+        sge[w].lkey = v.mr->lkey;
+        nb_tx++;
+      }
+      VT_CHECK(ibv_post_send(qps[0], &wr[0], &bad) == 0, "post");
+      ops += (uint64_t)pl;
+    } else {
+      seed ^= seed << 13;
+      seed ^= seed >> 7;
+      seed ^= seed << 17;
+      int qi = (int)(seed % (uint64_t)n_active);
+
+      for (int w = 0; w < pl; w++) {
+        memset(&wr[w], 0, sizeof(wr[w]));
+        memset(&sge[w], 0, sizeof(sge[w]));
         wr[w].opcode = IBV_WR_RDMA_WRITE;
+        wr[w].num_sge = 1;
+        wr[w].sg_list = &sge[w];
+        wr[w].next = (w == pl - 1) ? NULL : &wr[w + 1];
         wr[w].wr.rdma.remote_addr = remotes[qi].addr;
         wr[w].wr.rdma.rkey = remotes[qi].rkey;
+
+        int do_sig = (nb_tx_qp[qi] % (uint64_t)unsig == 0);
+        wr[w].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
+        if (nb_tx_qp[qi] >= (uint64_t)unsig &&
+            (nb_tx_qp[qi] % (uint64_t)unsig == (uint64_t)unsig - 1))
+          poll_one(scqs[qi]);
+        if (c.use_inline && c.size <= inl_cap)
+          wr[w].send_flags |= IBV_SEND_INLINE;
+
+        sge[w].addr = (uintptr_t)v.buf;
+        sge[w].length = (uint32_t)c.size;
+        sge[w].lkey = v.mr->lkey;
+        nb_tx_qp[qi]++;
       }
-      if (do_sig)
-        sig_posted[qi]++;
-      nb_tx[qi]++;
+      VT_CHECK(ibv_post_send(qps[qi], &wr[0], &bad) == 0, "post");
+      ops += (uint64_t)pl;
     }
-    VT_CHECK(ibv_post_send(qps[qi], &wr[0], &bad) == 0, "post");
-    ops += (uint64_t)pl;
   }
 
   double sec = (vt_ns() - t0) / 1e9;
   if (sec < 1e-6)
     sec = 1e-6;
   if (c.mode == FIG6_IN_WRITE)
-    printf("fig6 In-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
-           n_local, c.size);
+    printf("fig6 In-WRITE: %.2f Mops  paper_N=%d nqp=%d size=%d\n",
+           ops / sec / 1e6, paper_n, n_active, c.size);
   else if (c.mode == FIG6_OUT_SEND_UD)
-    printf("fig6 Out-SEND: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
-           n_local, c.size);
+    printf("fig6 Out-SEND: %.2f Mops  paper_N=%d ndest=%d size=%d\n",
+           ops / sec / 1e6, paper_n, n_ah, c.size);
   else
-    printf("fig6 Out-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
-           n_local, c.size);
+    printf("fig6 Out-WRITE: %.2f Mops  paper_N=%d nqp=%d size=%d\n",
+           ops / sec / 1e6, paper_n, n_active, c.size);
 
-  for (int i = 0; i < n_local; i++) {
+  for (int i = 0; i < n_ah; i++) {
     if (ahs[i])
       ibv_destroy_ah(ahs[i]);
+  }
+  for (int i = 0; i < n_local; i++) {
     ibv_destroy_qp(qps[i]);
-    ibv_destroy_cq(cqs[i]);
+    if (is_ud && rcqs[i] && rcqs[i] != scqs[i])
+      ibv_destroy_cq(rcqs[i]);
+    ibv_destroy_cq(scqs[i]);
   }
   vt_close_device(&v);
   return 0;

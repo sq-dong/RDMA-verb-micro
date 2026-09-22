@@ -18,10 +18,12 @@ RESULTS_DIR="${RESULTS_DIR:-$BENCH_DIR/results}"
 mkdir -p "$RESULTS_DIR"
 
 SRV_HOST="${SRV_HOST:-}"
-CLT_HOST="${CLT_HOST:-server03}"
+# Prefer thoth (jumbo MTU / IB 4096) so Fig.4 large WRITE≤READ matches the paper.
+# server03 shares 10.0.0.21 but stays at MTU 1500 → IB 1024 and loses the crossover.
+CLT_HOST="${CLT_HOST:-thoth}"
 CLT_HOST2="${CLT_HOST2:-}"
 SRV_DEV="${SRV_DEV:-mlx5_0}"
-CLT_DEV="${CLT_DEV:-mlx5_3}"
+CLT_DEV="${CLT_DEV:-mlx5_1}"
 CLT_DEV2="${CLT_DEV2:-mlx5_1}"
 SRV_IP="${SRV_IP:-10.0.0.20}"
 SRV_GID="${SRV_GID:-4}"
@@ -55,7 +57,8 @@ client_gid_for() {
   fi
 }
 
-log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+# Always stderr so `mops=$(run_one_trial …)` / other captures stay clean.
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
 # Run a command on host (empty SRV_HOST / "local" => local bash).
 remote() {

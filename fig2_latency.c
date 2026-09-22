@@ -12,7 +12,8 @@
  *   write       signaled RDMA WRITE (RC), time post->CQE
  *   write_inl   same + IBV_SEND_INLINE
  *   read        signaled RDMA READ (RC)
- *   echo        UC WRITE request + UC WRITE response, poll memory; print RTT and RTT/2
+ *   echo        RC WRITE request + RC WRITE response, poll memory; print RTT and RTT/2
+ *               (paper Fig.2a: "WR-I, RC (ECHO)"; ww-echo-style flag poll)
  *
  * Unused alternative (perftest-style, not used — kept for reference).
  * Always signaled; cannot measure unsignaled WRITE or ECHO/2:
@@ -212,17 +213,15 @@ static int wait_flag_eq(volatile uint8_t *flag, uint8_t expect, int timeout_us) 
 }
 
 /*
- * ECHO: both sides UC WRITE + poll buf[0]. Matches ww-echo.
- * Client times full RTT; prints echo_rtt and echo_rtt/2 (paper Fig.2).
+ * ECHO: both sides RC WRITE + poll buf[0] (paper Fig.2a "WR-I, RC (ECHO)").
+ * Control flow matches ww-echo; transport is RC for paper fidelity
+ * (ww-echo allows --use_uc; Fig.2 diagram specifies RC).
  *
- * RoCE UC can drop packets with no retry. Without a timeout the client
- * busy-waits forever and collect_fig2 hangs. We:
- *   - put a sequence in flag/payload[0] so late replies are ignored
- *   - time out the flag poll and retransmit (timing only the successful try)
+ * Sequence + timeout/retry kept as a backstop so collect never hangs if the
+ * peer dies mid-run (RC normally delivers; retries should be rare).
  */
 static void run_echo(struct cfg *c) {
-  enum ibv_qp_type qpt = IBV_QPT_UC;
-  /* Per-try flag wait; well above ~3us RTT, short enough to recover fast. */
+  enum ibv_qp_type qpt = IBV_QPT_RC;
   const int flag_timeout_us = 2000;
   const int max_tries = 64;
   int use_inl = 1;
@@ -342,12 +341,12 @@ static void run_echo(struct cfg *c) {
           retries += try;
         break;
       }
-      /* Dropped on RoCE UC — clear any late reply and retransmit. */
+      /* No reply in time — clear stale flag and retransmit. */
       *flag = 0;
     }
 
     if (!ok)
-      VT_DIE("echo: no response after retries (UC loss on RoCE?)");
+      VT_DIE("echo: no response after retries (peer stuck?)");
 
     if (i >= c->warmup) {
       double us = (t1 - t0) / 1000.0;

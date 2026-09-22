@@ -53,7 +53,7 @@ config is commented in `scripts/paper_config.sh` / `common.h`):
 | Fig. 3 | 4 … 4096 | powers of 2 to 4096 | **no** inline (DMA WRITE / READ) |
 | Fig. 4 | ≤828 denser mid-range | stop at RC inline cliff (paper: small INLINE WRITE > READ) | WR-UC-INLINE / SEND-UD inline; WRITE-UC / READ no |
 | Fig. 5 | (bars) | fixed **32** bytes; median of trials | only `+inlined` uses INLINE |
-| Fig. 6 | 0 … 16 (paper N) | Out-WRITE **N²** QPs; In-WRITE **N** QPs; UD: 1 QP | all inlined |
+| Fig. 6 | 0 … 16 (paper N) | Out-WRITE **N²/N²**; In-WRITE **N req / N² rsp**; Out-SEND **1 QP + N AH**; postlist=1 unsig=4 | all inlined |
 
 **Inline create-time grant:** do **not** create QPs with the NIC's absolute
 max (~828 B). That inflates WQE size and destroys message rate (see
@@ -135,7 +135,7 @@ ConnectX-5 RoCE vs the paper's ConnectX-3 InfiniBand; compare curve *shape*.
 
 | Paper term | Flag here |
 |------------|-----------|
-| UC | `fig3`: `--uc` / `--rc`; `fig4`: `-m write_uc`; echo WRITE path defaults to UC |
+| UC / RC | `fig2` ECHO: **RC** (paper Fig.2a); `fig3`: `--uc`/`--rc`; `fig4`: `-m write_uc`; fig5 WRITE path defaults to UC |
 | UD SEND | `fig4 -m send_ud`; `fig5 -m ws\|ss` |
 | inline | Create QP with `vt_inline_grant(size)` (libhrd-style small WQE). HW ceiling RC/UC **828 B**, UD **956 B** is only for large Fig.2 sweeps. Fig.3 WRITE/READ and Fig.4 WRITE-UC: `--no-inline`. |
 | unsignaled / selective signaling | `-Q` (signal once every Q WRs) |

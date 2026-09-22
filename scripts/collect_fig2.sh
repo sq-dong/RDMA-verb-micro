@@ -36,7 +36,7 @@ run_one() {
   sleep 1
 
   # Hard timeout around the binary so a stuck size cannot freeze collect.
-  # (Echo also retries inside the binary on UC drops.)
+  # (Echo uses RC per paper Fig.2a; binary still has a timeout/retry backstop.)
   local clt_timeout=120
   local clt_cmd="cd '$BENCH_DIR' && timeout ${clt_timeout}s ./fig2_latency -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m $mode -l $size -n 5000 -w 500"
   set +e

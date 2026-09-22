@@ -21,12 +21,17 @@ paper_assert_inline_sync
 CSV="$RESULTS_DIR/fig5.csv"
 rm -f "$CSV"
 csv_header "$CSV" "echo_type,opt,mops"
+# Always scrub trial logs — including early ERROR exits that skip the footer.
+trap 'cleanup_logs "$RESULTS_DIR"' EXIT
 
 SIZE=$PAPER_MSG_SIZE
 WINDOW=$PAPER_ECHO_WINDOW
-DURATION=$PAPER_TPUT_SEC
+DURATION=$PAPER_FIG5_SEC
 TRIALS=$PAPER_FIG5_TRIALS
-log "fig5 size=${SIZE}B window=$WINDOW trials=$TRIALS unsig=$PAPER_UNSIG_ECHO (inline only on +inlined)"
+WARMUP=$PAPER_FIG5_WARMUP_TRIALS
+GAP=$PAPER_FIG5_GAP_SEC
+TOTAL_RUNS=$((TRIALS + WARMUP))
+log "fig5 size=${SIZE}B window=$WINDOW measure=${TRIALS} warmup=${WARMUP} sec=$DURATION unsig=$PAPER_UNSIG_ECHO"
 
 # echo_type|binary_mode|opt_name|extra_flags
 declare -a JOBS=(
@@ -45,16 +50,22 @@ declare -a JOBS=(
 )
 
 median_of() {
-  # stdin: one float per line → stdout: median
-  sort -n | awk '
-    { a[NR] = $1 }
+  # stdin: one float per line → stdout: median (ignore non-numeric noise)
+  awk '/^[0-9]+(\.[0-9]+)?$/ { a[++n] = $1 + 0 }
     END {
-      if (NR == 0) { print ""; exit }
-      if (NR % 2) print a[(NR + 1) / 2]
-      else printf "%.2f\n", (a[NR / 2] + a[NR / 2 + 1]) / 2
+      if (n == 0) { print ""; exit }
+      # insertion sort (n is tiny)
+      for (i = 2; i <= n; i++) {
+        v = a[i]; j = i - 1
+        while (j >= 1 && a[j] > v) { a[j + 1] = a[j]; j-- }
+        a[j + 1] = v
+      }
+      if (n % 2) printf "%.2f\n", a[(n + 1) / 2]
+      else printf "%.2f\n", (a[n / 2] + a[n / 2 + 1]) / 2
     }'
 }
 
+# stdout MUST be only the Mops float — client chatter goes to the log / stderr.
 run_one_trial() {
   local etype=$1 mode=$2 opt=$3 flags=$4 port=$5 trial=$6
   local srv_log clt_log srv_cmd clt_cmd pid rc line mops
@@ -65,15 +76,17 @@ run_one_trial() {
   pid=$(remote_bg "${SRV_HOST:-local}" "$srv_log" "$srv_cmd")
   sleep 1
 
-  clt_cmd="cd '$BENCH_DIR' && timeout $((DURATION + 25))s ./fig5_echo -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m $mode -l $SIZE -w $WINDOW -D $DURATION $flags"
+  clt_cmd="cd '$BENCH_DIR' && timeout $((DURATION + 40))s ./fig5_echo -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m $mode -l $SIZE -w $WINDOW -D $DURATION $flags"
   set +e
-  remote "$CLT_HOST" "$clt_cmd" | tee "$clt_log"
+  # tee to stderr so `mops=$(run_one_trial …)` does not swallow banner/ECHO lines
+  # (those sorted as 0 under sort -n → median 0.00 for every bar).
+  remote "$CLT_HOST" "$clt_cmd" 2>&1 | tee "$clt_log" >&2
   rc=${PIPESTATUS[0]}
   set -e
   kill_pid "$pid"
   kill_bench "$SRV_HOST"
   kill_bench "$CLT_HOST"
-  sleep 0.4
+  sleep 0.5
 
   if [[ $rc -eq 124 ]]; then
     log "WARN timeout $etype $opt trial=$trial"
@@ -89,7 +102,7 @@ run_one_trial() {
     log "WARN parse $clt_log trial=$trial"
     return 1
   fi
-  echo "$mops"
+  printf '%s\n' "$mops"
   return 0
 }
 
@@ -104,17 +117,20 @@ for job in "${JOBS[@]}"; do
   IFS='|' read -r etype mode opt flags <<<"$job"
   port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig5 $etype $opt mode=$mode (${TRIALS} trials)"
+  log "fig5 $etype $opt mode=$mode (${WARMUP} warmup + ${TRIALS} measure)"
 
   samples=""
   t=0
-  while [[ $t -lt $TRIALS ]]; do
+  while [[ $t -lt $TOTAL_RUNS ]]; do
     t=$((t + 1))
     mops=$(run_one_trial "$etype" "$mode" "$opt" "$flags" "$port" "$t" || true)
-    if [[ -n "${mops:-}" ]]; then
+    if [[ $t -le $WARMUP ]]; then
+      log "  warmup $t: ${mops:-fail} Mops (discarded)"
+    elif [[ -n "${mops:-}" ]]; then
       samples+="${mops}"$'\n'
-      log "  trial $t: $mops Mops"
+      log "  trial $((t - WARMUP)): $mops Mops"
     fi
+    sleep "$GAP"
   done
 
   med=$(printf '%s' "$samples" | median_of)
@@ -133,6 +149,6 @@ if [[ "$nrows" -lt 13 ]]; then
   exit 1
 fi
 
-log "wrote $CSV ($((nrows - 1)) bars, median of $TRIALS)"
+log "wrote $CSV ($((nrows - 1)) bars, median of $TRIALS after $WARMUP warmup)"
 python3 "$SCRIPT_DIR/plot_paper_figs.py" --fig 5 --results-dir "$RESULTS_DIR"
-cleanup_logs "$RESULTS_DIR"
+# logs removed by EXIT trap

@@ -119,13 +119,15 @@ static void tcp_ready(int fd, int is_server) {
 
 static struct ibv_qp *qp_on_cqs(struct vt_ctx *v, struct ibv_cq *scq,
                                 struct ibv_cq *rcq, enum ibv_qp_type type,
-                                int max_inline, int rq_depth) {
+                                int max_inline, int rq_depth, int sq_depth) {
   struct ibv_qp_init_attr attr;
   memset(&attr, 0, sizeof(attr));
   attr.send_cq = scq;
   attr.recv_cq = rcq;
   attr.qp_type = type;
-  attr.cap.max_send_wr = VT_SQ_DEPTH;
+  if (sq_depth < 64)
+    sq_depth = 64;
+  attr.cap.max_send_wr = (uint32_t)sq_depth;
   attr.cap.max_recv_wr = (uint32_t)rq_depth;
   attr.cap.max_send_sge = 1;
   attr.cap.max_recv_sge = 1;
@@ -209,9 +211,11 @@ static void run_ww(struct cfg *c) {
   uint64_t lim = c->is_server ? deadline + 3000000000ull : deadline;
 
   /*
-   * ww-echo: post window WRITEs, signal last, poll 1 CQE, wait on flag.
-   * Payload lives in MR (send_buf). ww-echo always inlines; --no-inline
-   * must still DMA from registered memory or we get LOC_PROT_ERR.
+   * ww-echo: post window WRITEs, signal *first* WR, poll 1 CQE, wait on flag.
+   * Signaling the first WR (not the last) lets the remaining WRs complete in
+   * the background while we spin on the echo flag — selective signaling then
+   * actually helps. Signaling the last serializes the whole window before the
+   * flag wait and inverted the Fig.5 WR/WR bar order.
    */
   if (c->is_server) {
     printf("fig5 ww server win=%d size=%d\n", win, c->size);
@@ -231,7 +235,7 @@ static void run_ww(struct cfg *c) {
         if (c->unsig <= 1)
           wr[w].send_flags = IBV_SEND_SIGNALED;
         else
-          wr[w].send_flags = (w == win - 1) ? IBV_SEND_SIGNALED : 0;
+          wr[w].send_flags = (w == 0) ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[w].send_flags |= IBV_SEND_INLINE;
         sgl[w].addr = (uintptr_t)send_buf;
@@ -262,7 +266,7 @@ static void run_ww(struct cfg *c) {
         if (c->unsig <= 1)
           wr[w].send_flags = IBV_SEND_SIGNALED;
         else
-          wr[w].send_flags = (w == win - 1) ? IBV_SEND_SIGNALED : 0;
+          wr[w].send_flags = (w == 0) ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[w].send_flags |= IBV_SEND_INLINE;
         sgl[w].addr = (uintptr_t)send_buf;
@@ -293,15 +297,48 @@ done_ww:
   vt_close_device(&v);
 }
 
-/* -------- WRITE / SEND (ws-echo) -------- */
+/* -------- WRITE / SEND (ws-echo) --------
+ *
+ * Control flow must match rdma_bench/ws-echo/{client,worker}.c:
+ *   Client (open-loop): postlist RDMA WRITEs; poll RECV only after 512
+ *     outstanding; selective SIGNAL on WRITE CQ — never drain the whole
+ *     postlist before the next doorbell.
+ *   Server (worker): poll request counter in memory; batch UD SEND replies;
+ *     selective SIGNAL on SEND CQ — never wait for all prior SENDs before
+ *     scanning for new requests (that serialized us to ~1/RTT).
+ *
+ * Paper uses NUM_WORKERS=5 × NUM_CLIENTS=64; we keep 1:1 but the same
+ * open-loop pipeline so opts (UC / unsignalled / inlined) can actually move
+ * the needle. Absolute Mops stay below the paper's multi-worker aggregate.
+ */
 static void run_ws(struct cfg *c) {
   enum ibv_qp_type conn_t = c->use_uc ? IBV_QPT_UC : IBV_QPT_RC;
   int postlist = c->window;
   int inl_c = vt_inline_grant(c->size, c->use_inline, 0);
   int inl_d = vt_inline_grant(c->size, c->use_inline, 1);
-  /* ws-echo: start polling RECVs after 512 outstanding. */
+  /* ws-echo/main.c wants HRD_Q_DEPTH=1024 for UNSIG_BATCH=256. */
+  const int sq_depth = 512;
   const int pipeline = 512;
-  const int rq_depth = 2048;
+  const int rq_depth = 1024;
+  int unsig = c->unsig;
+  if (unsig < 1)
+    unsig = 1;
+  /*
+   * ws-echo: UNSIG_BATCH >= 2 * MAX_POSTLIST so the wrap poll never runs
+   * before a signaled WR from an earlier doorbell has been posted.
+   */
+  if (unsig > 1 && unsig < 2 * postlist)
+    unsig = 2 * postlist;
+  if (unsig > sq_depth / 2)
+    unsig = sq_depth / 2;
+  if (unsig > 1 && unsig < 2 * postlist) {
+    /* SQ too shallow for this postlist — shrink postlist. */
+    postlist = unsig / 2;
+    if (postlist < 1)
+      postlist = 1;
+  }
+  const int unsig_mask = unsig - 1;
+  const int unsig_pow2 = (unsig > 1) && ((unsig & (unsig - 1)) == 0);
 
   struct vt_ctx v;
   vt_open_device(&v, c->dev, 1, c->gid_index);
@@ -309,14 +346,15 @@ static void run_ws(struct cfg *c) {
                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                    IBV_ACCESS_REMOTE_READ);
 
-  struct ibv_cq *conn_cq = ibv_create_cq(v.ctx, VT_CQ_DEPTH, NULL, NULL, 0);
-  struct ibv_cq *dgram_scq = ibv_create_cq(v.ctx, VT_CQ_DEPTH, NULL, NULL, 0);
-  struct ibv_cq *dgram_rcq = ibv_create_cq(v.ctx, VT_CQ_DEPTH, NULL, NULL, 0);
+  struct ibv_cq *conn_cq = ibv_create_cq(v.ctx, sq_depth, NULL, NULL, 0);
+  struct ibv_cq *dgram_scq = ibv_create_cq(v.ctx, sq_depth, NULL, NULL, 0);
+  struct ibv_cq *dgram_rcq = ibv_create_cq(v.ctx, rq_depth, NULL, NULL, 0);
   VT_CHECK(conn_cq && dgram_scq && dgram_rcq, "cq");
 
-  struct ibv_qp *cqp = qp_on_cqs(&v, conn_cq, conn_cq, conn_t, inl_c, VT_RQ_DEPTH);
+  struct ibv_qp *cqp =
+      qp_on_cqs(&v, conn_cq, conn_cq, conn_t, inl_c, VT_RQ_DEPTH, sq_depth);
   struct ibv_qp *dqp =
-      qp_on_cqs(&v, dgram_scq, dgram_rcq, IBV_QPT_UD, inl_d, rq_depth);
+      qp_on_cqs(&v, dgram_scq, dgram_rcq, IBV_QPT_UD, inl_d, rq_depth, sq_depth);
 
   uint32_t cpsn = (uint32_t)(vt_ns() & 0xffffff);
   uint32_t dpsn = (uint32_t)((vt_ns() >> 8) & 0xffffff);
@@ -339,19 +377,15 @@ static void run_ws(struct cfg *c) {
   vt_create_ud_ah(&v, &dvq);
 
   memset(v.buf, 0, VT_BUF_SIZE);
+  /* Request region: one cacheline slot (1:1). Multi-worker would stripe. */
   volatile long long *req_slot = (volatile long long *)v.buf;
 
-  /* Staging in MR (ww/ws-echo use malloc+INLINE; --no-inline needs MR).
-   *   [0, 64):        req_slot
-   *   [64, 4096):     UD RECV staging (client)
-   *   [4096, 8192):   server SEND response
-   *   [8192, ...):    client WRITE request postlist slots
-   */
   int msg = c->size < 8 ? 8 : c->size;
   uint8_t *resp_buf = v.buf + 4096;
   memset(resp_buf, 1, (size_t)msg);
+  /* Client WRITE sources: postlist slots (MR for --no-inline). */
   uint8_t *req_area = v.buf + 8192;
-  VT_CHECK(8192 + (size_t)postlist * (size_t)msg <= VT_BUF_SIZE, "ws");
+  VT_CHECK(8192 + (size_t)postlist * (size_t)msg + 64 <= VT_BUF_SIZE, "ws");
 
   struct ibv_send_wr wr[128], *bad;
   struct ibv_sge sgl[128];
@@ -361,28 +395,24 @@ static void run_ws(struct cfg *c) {
   uint64_t deadline = t0 + (uint64_t)c->duration * 1000000000ull;
 
   if (c->is_server) {
-    printf("fig5 ws server postlist=%d\n", postlist);
+    printf("fig5 ws server postlist=%d unsig=%d sq=%d\n", postlist, unsig,
+           sq_depth);
     fflush(stdout);
     tcp_ready(fd, 1);
     close(fd);
     long long last_req = 0;
-    uint64_t nb_dgram = 0, sig_posted = 0, sig_reaped = 0;
-    uint64_t lim = deadline + 3000000000ull;
+    uint64_t nb_dgram = 0;
+    uint64_t lim = deadline + 5000000000ull;
 
     while (vt_ns() < lim) {
-      /* Block until all prior signaled SENDs complete — keeps SQ from
-       * overflowing when catch-up posts a full postlist repeatedly. */
-      while (sig_posted > sig_reaped) {
-        poll_n(dgram_scq, 1);
-        sig_reaped++;
-      }
-
       int nnew = 0;
+      struct ibv_send_wr *first = NULL, *last = NULL;
+
+      /* Catch-up: one SEND per unseen sequence step (slot may jump). */
       while (nnew < postlist) {
         long long cur = *req_slot;
         if (cur == last_req)
           break;
-        /* ws-echo catch-up: one SEND per missed sequence step. */
         last_req++;
 
         memset(&wr[nnew], 0, sizeof(wr[nnew]));
@@ -390,34 +420,54 @@ static void run_ws(struct cfg *c) {
         wr[nnew].num_sge = 1;
         wr[nnew].sg_list = &sgl[nnew];
         wr[nnew].next = NULL;
-        int do_sig = (nb_dgram % (uint64_t)c->unsig == 0);
-        wr[nnew].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-        if (c->use_inline && c->size <= inl_d)
-          wr[nnew].send_flags |= IBV_SEND_INLINE;
         wr[nnew].wr.ud.ah = dvq.ah;
         wr[nnew].wr.ud.remote_qpn = dremote.qpn;
         wr[nnew].wr.ud.remote_qkey = 0x11111111;
         sgl[nnew].addr = (uintptr_t)resp_buf;
         sgl[nnew].length = (uint32_t)c->size;
         sgl[nnew].lkey = v.mr->lkey;
-        if (nnew > 0)
-          wr[nnew - 1].next = &wr[nnew];
-        if (do_sig)
-          sig_posted++;
+
+        /* ws-echo: SIGNAL when (nb_tx & UNSIG_BATCH_) == 0; poll on wrap.
+         * Never poll inside the first (or current) unsent postlist — that
+         * deadlocks. unsig >= 2*postlist guarantees wrap ⇒ prior doorbell. */
+        int do_sig;
+        if (unsig <= 1) {
+          do_sig = 1;
+        } else if (unsig_pow2) {
+          do_sig = ((nb_dgram & (uint64_t)unsig_mask) == 0);
+          if (nb_dgram >= (uint64_t)unsig &&
+              (nb_dgram & (uint64_t)unsig_mask) == (uint64_t)unsig_mask)
+            poll_n(dgram_scq, 1);
+        } else {
+          do_sig = (nb_dgram % (uint64_t)unsig == 0);
+          if (nb_dgram >= (uint64_t)unsig &&
+              ((nb_dgram + 1) % (uint64_t)unsig == 0))
+            poll_n(dgram_scq, 1);
+        }
+        wr[nnew].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
+        if (c->use_inline && c->size <= inl_d)
+          wr[nnew].send_flags |= IBV_SEND_INLINE;
+
+        if (!first)
+          first = &wr[nnew];
+        else
+          last->next = &wr[nnew];
+        last = &wr[nnew];
+
         nb_dgram++;
         nnew++;
       }
+
       if (nnew > 0) {
-        /* Always signal the last WR of this doorbell so one CQE reclaims SQ. */
-        if (!(wr[nnew - 1].send_flags & IBV_SEND_SIGNALED)) {
-          wr[nnew - 1].send_flags |= IBV_SEND_SIGNALED;
-          sig_posted++;
-        }
-        VT_CHECK(ibv_post_send(dqp, &wr[0], &bad) == 0, "ud send");
+        VT_CHECK(ibv_post_send(dqp, first, &bad) == 0, "ud send");
+        /* basic (-Q 1): reclaim the whole just-posted batch. */
+        if (unsig <= 1)
+          poll_n(dgram_scq, nnew);
       }
     }
   } else {
-    printf("fig5 ws client postlist=%d pipeline=%d\n", postlist, pipeline);
+    printf("fig5 ws client postlist=%d pipeline=%d unsig=%d\n", postlist,
+           pipeline, unsig);
     fflush(stdout);
     tcp_ready(fd, 0);
     close(fd);
@@ -429,37 +479,45 @@ static void run_ws(struct cfg *c) {
       if ((rolling & 0xff) == 0 && vt_ns() >= deadline)
         break;
 
-      /*
-       * Reap prior signaled WRITE completions BEFORE building the next
-       * postlist. With -Q 1 every WR is signaled → poll a full postlist.
-       */
-      if (nb_tx > 0) {
-        if (c->unsig <= 1)
-          poll_n(conn_cq, postlist);
-        else if ((nb_tx - (uint64_t)postlist) % (uint64_t)c->unsig == 0)
-          poll_n(conn_cq, 1);
-      }
-
       for (int i = 0; i < postlist; i++) {
+        /*
+         * ws-echo client.c: after 512 TX, poll 1 RECV then post a new RECV
+         * for every WRITE — open-loop, limited by RQ credits.
+         */
         if ((int)nb_tx >= pipeline) {
           while (ibv_poll_cq(dgram_rcq, 1, &wc) == 0) {
             if ((rolling & 0xff) == 0 && vt_ns() >= deadline)
               goto ws_done;
           }
-          if (wc.status != IBV_WC_SUCCESS)
+          if (wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "ws RECV wc %s\n", ibv_wc_status_str(wc.status));
             goto ws_done;
+          }
           echos++;
         }
-        /* RECV staging: after req_slot, before send staging. */
-        post_recv(dqp, &v, (uintptr_t)(v.buf + 64), 2048, (uint64_t)i);
+        post_recv(dqp, &v, (uintptr_t)(v.buf + 64), 2048, (uint64_t)nb_tx);
 
         memset(&wr[i], 0, sizeof(wr[i]));
         wr[i].opcode = IBV_WR_RDMA_WRITE;
         wr[i].num_sge = 1;
         wr[i].next = (i == postlist - 1) ? NULL : &wr[i + 1];
         wr[i].sg_list = &sgl[i];
-        wr[i].send_flags =
-            (nb_tx % (uint64_t)c->unsig == 0) ? IBV_SEND_SIGNALED : 0;
+
+        int do_sig;
+        if (unsig <= 1) {
+          do_sig = 1;
+        } else if (unsig_pow2) {
+          do_sig = ((nb_tx & (uint64_t)unsig_mask) == 0);
+          if (nb_tx >= (uint64_t)unsig &&
+              (nb_tx & (uint64_t)unsig_mask) == (uint64_t)unsig_mask)
+            poll_n(conn_cq, 1);
+        } else {
+          do_sig = (nb_tx % (uint64_t)unsig == 0);
+          if (nb_tx >= (uint64_t)unsig &&
+              ((nb_tx + 1) % (uint64_t)unsig == 0))
+            poll_n(conn_cq, 1);
+        }
+        wr[i].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl_c)
           wr[i].send_flags |= IBV_SEND_INLINE;
 
@@ -469,12 +527,15 @@ static void run_ws(struct cfg *c) {
         sgl[i].addr = (uintptr_t)slot;
         sgl[i].length = (uint32_t)msg;
         sgl[i].lkey = v.mr->lkey;
+        /* 1:1: all WRITEs land on the single request cacheline (catch-up). */
         wr[i].wr.rdma.remote_addr = cremote.addr;
         wr[i].wr.rdma.rkey = cremote.rkey;
         nb_tx++;
         rolling++;
       }
       VT_CHECK(ibv_post_send(cqp, &wr[0], &bad) == 0, "write");
+      if (unsig <= 1)
+        poll_n(conn_cq, postlist);
     }
   ws_done:
     {
@@ -487,6 +548,10 @@ static void run_ws(struct cfg *c) {
       double sec = (vt_ns() - t0) / 1e9;
       if (sec < 1e-6)
         sec = 1e-6;
+      /*
+       * Report completed echoes (RECV). Steady-state equals WRITE rate under
+       * the 512-credit window — same quantity ws-echo workers print.
+       */
       printf("fig5 ws ECHO: %.2f Mops (postlist=%d)\n", echos / sec / 1e6,
              postlist);
       fflush(stdout);
@@ -525,7 +590,7 @@ static void run_ss(struct cfg *c) {
   struct ibv_cq *rcq = ibv_create_cq(v.ctx, VT_CQ_DEPTH, NULL, NULL, 0);
   VT_CHECK(scq && rcq, "cq");
   /* Detach default cq unused. */
-  struct ibv_qp *qp = qp_on_cqs(&v, scq, rcq, qpt, inl, rq_depth);
+  struct ibv_qp *qp = qp_on_cqs(&v, scq, rcq, qpt, inl, rq_depth, VT_SQ_DEPTH);
 
   uint32_t psn = (uint32_t)(vt_ns() & 0xffffff);
   struct vt_endpoint local, remote;
