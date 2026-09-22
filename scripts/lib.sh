@@ -156,5 +156,7 @@ append_csv() {
 cleanup_logs() {
   local dir=${1:-$RESULTS_DIR}
   rm -f "$dir"/*.log
+  # Fig.6 multi-proc per-N scratch dirs (local + any NFS/shared path).
+  rm -rf "$dir"/fig6_N* "$dir"/fig6_clt_*
   log "removed logs under $dir (csv/png/pdf kept)"
 }

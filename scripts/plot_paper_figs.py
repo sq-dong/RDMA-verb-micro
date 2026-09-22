@@ -139,17 +139,31 @@ def _plot_equal_spaced(ax, pts, tick_order, **plot_kw):
     ax.plot(xs, ys2, **plot_kw)
 
 
-def _finish_equal_x(ax, tick_order, xlabel):
-    ax.set_xticks(range(len(tick_order)))
-    ax.set_xticklabels([str(int(t)) if float(t) == int(t) else str(t) for t in tick_order])
-    ax.set_xlim(-0.3, len(tick_order) - 0.7)
+def _finish_equal_x(ax, tick_order, xlabel, *, rotate=0, label_step=1):
+    """Equal-spaced category axis. label_step>1 thins visible tick labels."""
+    n = len(tick_order)
+    ax.set_xticks(range(n))
+    labels = []
+    for i, t in enumerate(tick_order):
+        text = str(int(t)) if float(t) == int(t) else str(t)
+        if label_step > 1 and (i % label_step) != 0 and i != n - 1:
+            labels.append("")
+        else:
+            labels.append(text)
+    ax.set_xticklabels(labels, rotation=rotate, ha="right" if rotate else "center")
+    ax.set_xlim(-0.3, n - 0.7)
     ax.set_xlabel(xlabel)
 
 
-def _save(fig, out_base: Path):
+def _save(fig, out_base: Path, *, pad_inches: float = 0.3):
     out_base.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(out_base) + ".pdf")
-    fig.savefig(str(out_base) + ".png")
+    # bbox_inches='tight' alone; avoid tight_layout() which can clip long/rotated labels.
+    fig.savefig(
+        str(out_base) + ".pdf", bbox_inches="tight", pad_inches=pad_inches
+    )
+    fig.savefig(
+        str(out_base) + ".png", bbox_inches="tight", pad_inches=pad_inches
+    )
     plt.close(fig)
     print(f"wrote {out_base}.pdf / .png")
 
@@ -330,7 +344,8 @@ def plot_fig4(results: Path, demo: bool = False):
 
     series = _series(rows, "curve", "size", "mops")
     ticks_fig4_meas = _x_ticks_from_rows(rows, "size", measure)
-    fig, ax = plt.subplots(figsize=(5.8, 3.6))
+    # Dense equal-spaced sizes → wider canvas + rotated, thinned labels.
+    fig, ax = plt.subplots(figsize=(11.0, 4.4))
     for name in ("WR-UC-INLINE", "SEND-UD", "WRITE-UC", "READ-RC"):
         pts = series.get(name, [])
         _plot_equal_spaced(
@@ -341,13 +356,18 @@ def plot_fig4(results: Path, demo: bool = False):
             color=COLORS.get(name, None),
             label=name,
             linewidth=1.6,
+            markersize=4.5,
         )
     ax.set_ylabel("Throughput (Mops)")
     ax.set_title("Figure 4: Outbound verbs throughput")
-    _finish_equal_x(ax, ticks_fig4_meas, "Size of payload (bytes)")
+    # Show every other label (always keep first/last) so dense HW sizes stay readable.
+    _finish_equal_x(
+        ax, ticks_fig4_meas, "Size of payload (bytes)", rotate=50, label_step=2
+    )
+    ax.tick_params(axis="x", labelsize=9, pad=2)
     ax.set_ylim(bottom=0)
     ax.legend(loc="best")
-    _save(fig, results / "fig4_outbound")
+    _save(fig, results / "fig4_outbound", pad_inches=0.4)
 
 
 def plot_fig5(results: Path, demo: bool = False):
@@ -423,7 +443,8 @@ def plot_fig6(results: Path, demo: bool = False):
     series = _series(rows, "curve", "n", "mops")
     present = sorted({int(float(r["n"])) for r in rows}) if rows else measure
     ticks_n = present if present else measure
-    fig, ax = plt.subplots(figsize=(5.2, 3.6))
+    # Extra room so the x-label is not clipped at the bottom/right edge.
+    fig, ax = plt.subplots(figsize=(6.6, 4.2))
     for name in ("In-WRITE-UC", "Out-WRITE-UC", "Out-SEND-UD"):
         pts = series.get(name, [])
         _plot_equal_spaced(
@@ -437,12 +458,16 @@ def plot_fig6(results: Path, demo: bool = False):
         )
     ax.set_ylabel("Throughput (Mops)")
     ax.set_title("Figure 6: UD vs UC for all-to-all (32 byte payloads)")
-    _finish_equal_x(
-        ax, ticks_n, "Number of client processes (= number of server processes)"
+    # Two-line label (paper: client procs = server procs); keep fully visible.
+    ax.set_xticks(range(len(ticks_n)))
+    ax.set_xticklabels(
+        [str(int(t)) if float(t) == int(t) else str(t) for t in ticks_n]
     )
+    ax.set_xlim(-0.3, len(ticks_n) - 0.7)
+    ax.set_xlabel("Number of client processes (= number of server processes)")
     ax.set_ylim(bottom=0)
     ax.legend(loc="best")
-    _save(fig, results / "fig6_scale")
+    _save(fig, results / "fig6_scale", pad_inches=0.4)
 
 
 def main():
