@@ -102,8 +102,8 @@ static void parse(int argc, char **argv, struct cfg *c) {
     c->unsig = 1;
   if (c->window < 1)
     c->window = 1;
-  if (c->window > 64)
-    c->window = 64;
+  if (c->window > 128)
+    c->window = 128;
 }
 
 static void tcp_ready(int fd, int is_server) {
@@ -204,8 +204,8 @@ static void run_ww(struct cfg *c) {
   memset(req_buf, 1, (size_t)c->size);
   memset(resp_buf, 1, (size_t)c->size);
 
-  struct ibv_send_wr wr[64], *bad;
-  struct ibv_sge sgl[64];
+  struct ibv_send_wr wr[128], *bad;
+  struct ibv_sge sgl[128];
   uint64_t echos = 0, iters = 0;
   uint64_t t0 = vt_ns();
   uint64_t deadline = t0 + (uint64_t)c->duration * 1000000000ull;
@@ -234,7 +234,8 @@ static void run_ww(struct cfg *c) {
         if (c->unsig <= 1)
           wr[w].send_flags = IBV_SEND_SIGNALED;
         else
-          wr[w].send_flags = (w == 0) ? IBV_SEND_SIGNALED : 0;
+          /* Signal LAST WR so its CQE covers the whole window (SQ reclaim). */
+          wr[w].send_flags = (w == win - 1) ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[w].send_flags |= IBV_SEND_INLINE;
         sgl[w].addr = (uintptr_t)resp_buf;
@@ -265,7 +266,7 @@ static void run_ww(struct cfg *c) {
         if (c->unsig <= 1)
           wr[w].send_flags = IBV_SEND_SIGNALED;
         else
-          wr[w].send_flags = (w == 0) ? IBV_SEND_SIGNALED : 0;
+          wr[w].send_flags = (w == win - 1) ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[w].send_flags |= IBV_SEND_INLINE;
         req_buf[0] = 1;
@@ -351,15 +352,15 @@ static void run_ws(struct cfg *c) {
   VT_CHECK(resp_buf, "malloc");
   memset(resp_buf, 1, (size_t)c->size);
 
-  long long *req_bufs[64];
+  long long *req_bufs[128];
   for (int i = 0; i < postlist; i++) {
     req_bufs[i] = malloc(c->size < 8 ? 8 : (size_t)c->size);
     VT_CHECK(req_bufs[i], "req");
     memset(req_bufs[i], 1, c->size < 8 ? 8 : (size_t)c->size);
   }
 
-  struct ibv_send_wr wr[64], *bad;
-  struct ibv_sge sgl[64];
+  struct ibv_send_wr wr[128], *bad;
+  struct ibv_sge sgl[128];
   struct ibv_wc wc;
   uint64_t nb_tx = 0, echos = 0;
   uint64_t t0 = vt_ns();
@@ -546,16 +547,18 @@ static void run_ss(struct cfg *c) {
   uint32_t recv_len =
       use_ud ? (uint32_t)c->size + 40 : (uint32_t)c->size; /* GRH for UD */
 
-  /* Fill RQ like ss-echo server. */
-  for (int i = 0; i < rq_depth; i++)
-    post_recv(qp, &v, (uintptr_t)v.buf, recv_len, (uint64_t)i);
+  /* Server pre-fills RQ (ss-echo). Client posts RECVs in the request loop. */
+  if (c->is_server) {
+    for (int i = 0; i < rq_depth; i++)
+      post_recv(qp, &v, (uintptr_t)v.buf, recv_len, (uint64_t)i);
+  }
 
   tcp_ready(fd, c->is_server);
   close(fd);
 
-  struct ibv_send_wr wr[64], *bad;
-  struct ibv_sge sgl[64];
-  struct ibv_wc wc[64];
+  struct ibv_send_wr wr[128], *bad;
+  struct ibv_sge sgl[128];
+  struct ibv_wc wc[128];
   uint64_t nb_tx = 0, echos = 0, rolling = 0;
   uint64_t t0 = vt_ns();
   uint64_t deadline = t0 + (uint64_t)c->duration * 1000000000ull;
@@ -624,8 +627,8 @@ static void run_ss(struct cfg *c) {
         wr[i].num_sge = 1;
         wr[i].next = (i == postlist - 1) ? NULL : &wr[i + 1];
         wr[i].sg_list = &sgl[i];
-        /* ss-echo client: only first of postlist signaled. */
-        wr[i].send_flags = (i == 0) ? IBV_SEND_SIGNALED : 0;
+        /* Signal last SEND so CQE covers the whole postlist. */
+        wr[i].send_flags = (i == postlist - 1) ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[i].send_flags |= IBV_SEND_INLINE;
         if (use_ud) {
@@ -639,8 +642,8 @@ static void run_ss(struct cfg *c) {
         rolling++;
       }
       VT_CHECK(ibv_post_send(qp, &wr[0], &bad) == 0, "send");
-      poll_n(scq, 1);              /* SEND completion for wr[0] */
-      poll_n(rcq, postlist);       /* all RECVs */
+      poll_n(scq, 1);        /* SEND completion for last WR */
+      poll_n(rcq, postlist); /* all RECVs */
       echos += (uint64_t)postlist;
       nb_tx += (uint64_t)postlist;
     }

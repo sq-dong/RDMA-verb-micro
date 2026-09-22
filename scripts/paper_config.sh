@@ -23,9 +23,12 @@ PAPER_INLINE_MAX_UD="${PAPER_INLINE_MAX_UD:-956}"
 
 PAPER_POSTLIST="${PAPER_POSTLIST:-64}"
 PAPER_UNSIG="${PAPER_UNSIG:-64}"
-PAPER_UNSIG_SCALE="${PAPER_UNSIG_SCALE:-4}"
+# Fig.6 with postlist: keep unsig >= postlist (one signal per doorbell batch).
+# PAPER_UNSIG_SCALE=4 is the paper/sender-scalability value for postlist=1.
+PAPER_UNSIG_SCALE="${PAPER_UNSIG_SCALE:-64}"
 
 PAPER_MSG_SIZE="${PAPER_MSG_SIZE:-32}"
+# ww-echo: win=64 beats 128 on CX-5 RoCE (post overhead vs RTT amplify)
 PAPER_ECHO_WINDOW="${PAPER_ECHO_WINDOW:-64}"
 
 PAPER_TPUT_SEC="${PAPER_TPUT_SEC:-3}"
@@ -57,12 +60,14 @@ PAPER_SIZES_OUT=(4 8 16 32 64 128 256 512 828 956 1024 2048 4096)
 # even older paper-ish:
 # PAPER_SIZES_OUT=(4 8 16 32 64 128 192 256)
 
-# Fig.6 x-axis = #QPs on the NIC (paper N=16 all-to-all ⇒ 256 QPs).
-# Out-SEND-UD ignores -q and stays at 1 QP.
+# Fig.6 x-axis = paper N (#client procs = #server procs).
+# Active QPs at RNICS = N*N (all-to-all). Out-SEND-UD stays at 1 QP.
 # shellcheck disable=SC2034
-PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
-# OLD wrong (treated -q as paper N and squared inside the binary):
-# PAPER_NQPS=(1 2 4 8 12 16 20)
+PAPER_NQPS=(1 2 4 8 12 16)
+# denser / CX-5 stress (QP count directly, not paper N):
+# PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
+# OLD wrong (passed N as QP count without squaring):
+# PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
 
 paper_assert_inline_sync() {
   local hdr="${BENCH_DIR:-.}/common.h"
