@@ -1,151 +1,76 @@
 # rdma_verb_test
 
-Microbenchmarks that reproduce **Section 3 (Figures 2–6)** of HERD / SIGCOMM'14
+Microbenchmarks that reproduce Section 3, Figures 2–6 of HERD / SIGCOMM’14
 (*Using RDMA Efficiently for Key-Value Services*).
 
-The measurement logic follows the same author's later `rdma_bench` suite (ATC'16).
-Connection setup does **not** use memcached / `libhrd`; peers exchange QP metadata
-over a plain **TCP** socket, which fits a typical RoCE lab setup.
+Measurement semantics follow the author’s later `rdma_bench` suite (ATC’16).
+Peers exchange QP metadata over TCP instead of memcached / `libhrd`, which fits
+a typical RoCE lab setup.
 
-## 1. Mapping to `rdma_bench` templates
+For reproduction details, result analysis, per-figure design notes, and operational
+caveats, see [docs/REPRODUCTION.md](docs/REPRODUCTION.md).
 
-| Paper figure | Binary here | Template paths |
-|--------------|-------------|----------------|
-| Fig. 2 latency | `fig2_latency` | `rdma_bench/rw-tput-receiver/main.cc` (README: set `kAppUnsigBatch=1`, `postlist=1` for latency); ECHO memory polling in `rdma_bench/ww-echo/{client,server}.c` |
-| Fig. 3 inbound throughput | `fig3_inbound` | `rdma_bench/rw-tput-receiver/main.cc` + `run-servers.sh` / `run-machine.sh` |
-| Fig. 4 outbound throughput | `fig4_outbound` | WRITE/READ: `rdma_bench/rw-tput-sender/main.cc`; UD SEND: `rdma_bench/ud-sender/main.cc` |
-| Fig. 5 ECHO | `fig5_echo` | WR/WR: `rdma_bench/ww-echo/{client,server}.c`; WR/SEND: `rdma_bench/ws-echo/{client,worker}.c` |
-| Fig. 6 QP scaling | `fig6_scale` | `rdma_bench/sender-scalability/main.cc` (outbound multi-QP) |
+## Mapping to `rdma_bench`
 
-Top-level notes: `rdma_bench/README.md` (benchmark table + selective-signaling section).
+| Paper figure | Binary | Template |
+|--------------|--------|----------|
+| Fig. 2 latency | `fig2_latency` | `rw-tput-receiver/main.cc`; ECHO polling in `ww-echo/{client,server}.c` |
+| Fig. 3 inbound | `fig3_inbound` | `rw-tput-receiver/main.cc`, `run-servers.sh` / `run-machine.sh` |
+| Fig. 4 outbound | `fig4_outbound` | `rw-tput-sender/main.cc`; UD SEND in `ud-sender/main.cc` |
+| Fig. 5 ECHO | `fig5_echo` | `ww-echo`, `ws-echo`; SEND/SEND patterned on UD messaging |
+| Fig. 6 QP scaling | `fig6_scale` | `sender-scalability/main.cc`; UD fan-out as in `ud-sender` |
 
-`rdma_bench/herd/` and the old `HERD/` repo contain **no** Fig. 2–6 microbenchmarks
-(only the full KV system). Do not use them as the source for these figures.
+`rdma_bench/herd/` and the old `HERD/` repo contain only the full KV system, not
+these microbenchmarks.
 
-## 2. Build
+## Build
 
 ```bash
 cd ~/rdma_verb_test
 make
 ```
 
-Dependencies: `libibverbs`, pthread, Python 3 + `matplotlib` + `numpy` (for plotting).
+Dependencies: `libibverbs`, pthread, Python 3, `matplotlib`, `numpy`.
 
-## 3. Machine layout (adjust IPs to your cluster)
+## Machine layout
 
-| Role | Host | RDMA device / netdev | Suggested IP |
-|------|------|----------------------|--------------|
+| Role | Host | Device / netdev | IP |
+|------|------|-----------------|-----|
 | server | smartx-server02 | `mlx5_0` / `enp59s0f0np0` | `10.0.0.20` |
 | client | smartx-server03 | `mlx5_3` / `enp24s0f0np0` | `10.0.0.21` |
-| client2 (optional for Figs. 3/6) | thoth | `mlx5_1` / `ens7f1np1` | `10.0.0.22` |
+| client2 optional | thoth | `mlx5_1` / `ens7f1np1` | `10.0.0.22` |
 
-All RDMA ports must share the same subnet and MTU. Always pass the **RDMA NIC IP**
-to `-a`, never the management address (`192.168.100.x`).
+Use the RDMA NIC IP for `-a`, never the management address. Pick `-x` from
+`show_gids` for the RoCEv2 row that matches that IPv4. All RDMA ports must share
+the same subnet and a consistent MTU.
 
-Pick `-x` from `show_gids` for the RoCEv2 row that matches that IPv4 address.
+Payload axes and inline policy live in `scripts/paper_config.sh`. Throughput paths
+use `vt_inline_grant(size)` so create-time inline stays near `HRD_MAX_INLINE` 60,
+not the NIC ceiling.
 
-Payload sweeps follow the **HW-native** axis on this CX-5 (old paper-256
-config is commented in `scripts/paper_config.sh` / `common.h`):
-
-| Figure | X axis | Measured sizes | Inline policy |
-|--------|--------|----------------|---------------|
-| Fig. 2 | 4 … 4096 | WRITE / READ: powers of 2 to 4096; WR-INLINE / ECHO: `…512,828` | only WR-INLINE + ECHO |
-| Fig. 3 | 4 … 4096 | powers of 2 to 4096 | **no** inline (DMA WRITE / READ) |
-| Fig. 4 | ≤828 denser mid-range | stop at RC inline cliff (paper: small INLINE WRITE > READ) | WR-UC-INLINE / SEND-UD inline; WRITE-UC / READ no |
-| Fig. 5 | (bars) | fixed **32** bytes; median of trials | only `+inlined` uses INLINE |
-| Fig. 6 | 0 … 16 (paper N) | Out-WRITE **N²/N²**; In-WRITE **N req / N² rsp**; Out-SEND **1 QP + N AH**; postlist=1 unsig=4 | all inlined |
-
-**Inline create-time grant:** do **not** create QPs with the NIC's absolute
-max (~828 B). That inflates WQE size and destroys message rate (see
-`rdma_bench/libhrd/hrd.h` `HRD_MAX_INLINE 60`). Throughput paths use
-`vt_inline_grant(size)` — request only what the run needs.
-
-Each `collect_fig*.sh` writes CSV, plots PNG/PDF, then deletes `*.log` (keeps CSV and figures).
-
-## 4. Automated collect and plot
+## Collect and plot
 
 ```bash
-# Load cluster / RDMA settings (edit scripts/setup_machine.sh if IPs/GIDs change)
 source ./scripts/setup_machine.sh
-
-# One figure at a time (writes CSV + PNG/PDF; deletes logs, keeps CSV)
 ./scripts/collect_fig2.sh
-./scripts/collect_fig3.sh   # uses CLT_HOST + CLT_HOST2 if set
+./scripts/collect_fig3.sh
 ./scripts/collect_fig4.sh
 ./scripts/collect_fig5.sh
 ./scripts/collect_fig6.sh
-
-# Or everything
-./scripts/collect_all.sh
+# or: ./scripts/collect_all.sh
 ```
 
-**Multi-client (paper Sec.3):** Fig.3 inbound and Fig.6 QP scaling need many
-clients most; Fig.4 outbound also pairs one server proc per client. Fig.2 / Fig.5
-are fine with one. With `CLT_HOST2=thoth` in `setup_machine.sh`, `collect_fig3.sh`
-runs both clients in parallel and **sums** Mops as a stand-in for multi-client
-inbound.
-
-Outputs:
-
-| CSV | Plot files |
-|-----|------------|
-| `results/fig2.csv` | `results/fig2_latency.{png,pdf}` |
-| `results/fig3.csv` | `results/fig3_inbound.{png,pdf}` |
-| `results/fig4.csv` | `results/fig4_outbound.{png,pdf}` |
-| `results/fig5.csv` | `results/fig5_echo.{png,pdf}` |
-| `results/fig6.csv` | `results/fig6_scale.{png,pdf}` |
-
-Re-plot from existing CSV without re-running RDMA:
+Each collector writes CSV and PNG/PDF under `results/`, then removes intermediate
+logs. Re-plot without re-running:
 
 ```bash
 python3 scripts/plot_paper_figs.py --fig all --results-dir results
 ```
 
-Preview plot style without measurements (synthetic paper-shaped curves):
-
-```bash
-python3 scripts/plot_paper_figs.py --fig all --demo --results-dir results
-```
-
-Plot titles / series names follow the SIGCOMM'14 captions
-(WRITE, WR-INLINE, READ, ECHO, ECHO/2; inbound/outbound Mops; ECHO bars;
-In-WRITE-UC / Out-WRITE-UC / Out-SEND-UD). Absolute numbers will differ on
-ConnectX-5 RoCE vs the paper's ConnectX-3 InfiniBand; compare curve *shape*.
-
-## 5. Manual quick start (start server first, then client)
-
-```bash
-./fig2_latency -s -d mlx5_0 -a 10.0.0.20 -p 18500 -x 4 -n 10000
-./fig2_latency -c -d mlx5_3 -a 10.0.0.20 -p 18500 -x <gid> -n 10000 -l 64 -m write
-
-./fig3_inbound -s -d mlx5_0 -a 10.0.0.20 -p 18510 -x 4
-./fig3_inbound -c -d mlx5_3 -a 10.0.0.20 -p 18510 -x <gid> -l 32 -t 64 -Q 64 --uc --no-inline -D 5
-
-./fig4_outbound -s -d mlx5_0 -a 10.0.0.20 -p 18520 -x 4 -R -l 32 -t 64 -Q 64 -m write_uc -D 5
-./fig4_outbound -c -d mlx5_3 -a 10.0.0.20 -p 18520 -x <gid> -R -l 32 -t 64 -Q 64 -m write_uc -D 5
-
-./fig5_echo -s -d mlx5_0 -a 10.0.0.20 -p 18530 -x 4 -m ws -l 32 -w 32 -D 5
-./fig5_echo -c -d mlx5_3 -a 10.0.0.20 -p 18530 -x <gid> -m ws -l 32 -w 32 -D 5
-
-./fig6_scale -s -d mlx5_0 -a 10.0.0.20 -p 18540 -x 4 -q 16 -l 32 -D 5
-./fig6_scale -c -d mlx5_3 -a 10.0.0.20 -p 18540 -x <gid> -q 16 -l 32 -D 5
-```
-
-## 6. Paper knobs  program flags
-
-| Paper term | Flag here |
-|------------|-----------|
-| UC / RC | `fig2` ECHO: **RC** (paper Fig.2a); `fig3`: `--uc`/`--rc`; `fig4`: `-m write_uc`; fig5 WRITE path defaults to UC |
-| UD SEND | `fig4 -m send_ud`; `fig5 -m ws\|ss` |
-| inline | Create QP with `vt_inline_grant(size)` (libhrd-style small WQE). HW ceiling RC/UC **828 B**, UD **956 B** is only for large Fig.2 sweeps. Fig.3 WRITE/READ and Fig.4 WRITE-UC: `--no-inline`. |
-| unsignaled / selective signaling | `-Q` (signal once every Q WRs) |
-| outstanding window | `-t` (postlist) or `fig5 -w` |
-| ECHO/2 | `fig2 -m echo` prints `rtt` and `rtt/2` |
-
-## 7. Layout
+## Layout
 
 - `common.h` / `common.c`: TCP exchange, RC/UC/UD bring-up, RoCE GID AH, timing, CQ poll
 - `fig*.c`: one binary per figure
-- `scripts/collect_fig*.sh`: sweep → CSV → plot
+- `scripts/collect_fig*.sh`: sweep, CSV, plot
 - `scripts/plot_paper_figs.py`: paper-style figures
-- Unused alternatives are kept as full block comments, not deleted
+- `docs/REPRODUCTION.md`: full reproduction notes and result discussion
