@@ -134,8 +134,9 @@ int main(int argc, char **argv) {
   int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                IBV_ACCESS_REMOTE_READ;
   vt_alloc_buf(&v, VT_BUF_SIZE, access);
-  int inl_cap = is_ud ? VT_MAX_INLINE_UD : VT_MAX_INLINE;
-  struct ibv_qp *qp = vt_create_qp(&v, qpt, inl_cap);
+  int want_inl = c.use_inline && !do_read;
+  int inl_cap = vt_inline_grant(c.size, want_inl, is_ud);
+  struct ibv_qp *qp = vt_create_qp(&v, qpt, inl_cap, NULL, NULL);
   uint32_t psn = (uint32_t)(vt_ns() & 0xffffff);
   struct vt_endpoint local, remote;
   vt_fill_local_ep(&v, qp, psn, &local);

@@ -1,18 +1,14 @@
 /*
- * fig6_scale.c — HERD Sec.3 Fig.6: UC WRITE / UD SEND vs number of QPs.
+ * fig6_scale.c — HERD Sec.3 Fig.6: UC WRITE / UD SEND vs #QPs.
  *
- * Paper: all-to-all among N processes ⇒ N² QPs in the *cluster*, but each
- * process only owns N QPs.  The NIC-cache pressure knob is therefore -q N
- * (NOT N*N).  ConnectX-3 thrashed by N≈16; CX-5 needs much larger N.
+ * Paper: N client procs × N server procs all-to-all ⇒ N² QPs at RNICS.
+ * With two machines we approximate that NIC-cache pressure by creating
+ * N² connected QPs for Out-WRITE / In-WRITE (-q N is paper's N).
+ * Out-SEND-UD keeps 1 QP (datagram scales by design).
  *
  * Template: rdma_bench/sender-scalability/main.cc
- *   - one CQ *per* QP (shared CQ + many QPs corrupts signaling / overflows)
+ *   - one CQ per QP
  *   - unsig batch 4, inline WRITE, random QP pick
- *
- * Modes (-M):
- *   out-write     server → client UC WRITE across N QPs (drops with N)
- *   in-write      client → server UC WRITE across N QPs (stays high)
- *   out-send-ud   server → client UD SEND on *1* QP (flat by design)
  */
 
 #include "common.h"
@@ -32,7 +28,7 @@ struct cfg {
   uint16_t port;
   int gid_index;
   int size;
-  int nqp;
+  int n; /* paper's N (client procs = server procs) */
   int unsig;
   int duration;
   int use_inline;
@@ -43,8 +39,9 @@ struct cfg {
 static void usage(const char *a) {
   fprintf(stderr,
           "Usage: %s -s|-c -d DEV -a IP [-p PORT] [-M out-write|in-write|"
-          "out-send-ud] [-q NQPS] [-l SIZE] [-Q UNSIG] [-D SEC] "
-          "[--no-inline] [--rc]\n",
+          "out-send-ud] [-q N] [-l SIZE] [-Q UNSIG] [-D SEC] "
+          "[--no-inline] [--rc]\n"
+          "  -q N : paper's N; connected modes create N*N QPs\n",
           a);
   exit(1);
 }
@@ -66,7 +63,7 @@ static void parse(int argc, char **argv, struct cfg *c) {
   c->port = 18540;
   c->gid_index = 3;
   c->size = 32;
-  c->nqp = 16;
+  c->n = 16;
   c->unsig = 4;
   c->duration = 5;
   c->use_inline = 1;
@@ -102,7 +99,7 @@ static void parse(int argc, char **argv, struct cfg *c) {
       c->size = atoi(optarg);
       break;
     case 'q':
-      c->nqp = atoi(optarg);
+      c->n = atoi(optarg);
       break;
     case 'Q':
       c->unsig = atoi(optarg);
@@ -125,8 +122,8 @@ static void parse(int argc, char **argv, struct cfg *c) {
   }
   if (c->is_server < 0 || !c->dev || !c->ip)
     usage(argv[0]);
-  if (c->nqp < 1 || c->nqp > VT_MAX_QPS) {
-    fprintf(stderr, "nqp must be 1..%d\n", VT_MAX_QPS);
+  if (c->n < 1) {
+    fprintf(stderr, "n must be >= 1\n");
     exit(1);
   }
 }
@@ -190,16 +187,28 @@ int main(int argc, char **argv) {
 
   const int is_ud = (c.mode == FIG6_OUT_SEND_UD);
   /*
-   * Out-SEND-UD: paper keeps a flat curve because UD does not thrash the
-   * connected-QP cache.  Use 1 local UD QP (and 1 remote) regardless of -q.
-   * -q still labels the x-axis for the collect script.
+   * Paper Fig.6: N procs × N peers ⇒ N² QPs at the NIC.
+   * UD: always 1 QP (flat curve by design).
    */
-  const int n_local = is_ud ? 1 : c.nqp;
-  const int n_exch = is_ud ? 1 : c.nqp;
+  int n_local;
+  if (is_ud)
+    n_local = 1;
+  else {
+    long long nn = (long long)c.n * (long long)c.n;
+    if (nn > VT_MAX_QPS) {
+      fprintf(stderr,
+              "fig6: N=%d ⇒ N²=%lld QPs exceeds VT_MAX_QPS=%d; "
+              "raise VT_MAX_QPS or use smaller N\n",
+              c.n, nn, VT_MAX_QPS);
+      exit(1);
+    }
+    n_local = (int)nn;
+  }
+  const int n_exch = n_local;
 
   enum ibv_qp_type qpt =
       is_ud ? IBV_QPT_UD : (c.use_uc ? IBV_QPT_UC : IBV_QPT_RC);
-  const int inl_cap = is_ud ? VT_MAX_INLINE_UD : VT_MAX_INLINE;
+  const int inl_cap = vt_inline_grant(c.size, c.use_inline, is_ud);
 
   struct vt_ctx v;
   vt_open_device(&v, c.dev, 1, c.gid_index);
@@ -242,7 +251,7 @@ int main(int argc, char **argv) {
   }
 
   if (!i_am_sender(&c)) {
-    printf("fig6 passive nqp=%d mode=%d\n", n_local, (int)c.mode);
+    printf("fig6 passive N=%d nqp=%d mode=%d\n", c.n, n_local, (int)c.mode);
     fflush(stdout);
     if (is_ud) {
       for (int r = 0; r < VT_RQ_DEPTH / 2; r++)
@@ -274,7 +283,6 @@ int main(int argc, char **argv) {
   uint64_t t0 = vt_ns();
   uint64_t deadline = t0 + (uint64_t)c.duration * 1000000000ull;
 
-  /* Hot path mirrors sender-scalability: no memset of wr each iter. */
   memset(&wr, 0, sizeof(wr));
   memset(&sge, 0, sizeof(sge));
   wr.num_sge = 1;
@@ -291,6 +299,10 @@ int main(int argc, char **argv) {
   } else {
     wr.opcode = IBV_WR_RDMA_WRITE;
   }
+
+  printf("fig6 sender N=%d nqp=%d size=%d inl=%d\n", c.n, n_local, c.size,
+         inl_cap);
+  fflush(stdout);
 
   while (vt_ns() < deadline) {
     seed ^= seed << 13;
@@ -316,14 +328,14 @@ int main(int argc, char **argv) {
 
   double sec = (vt_ns() - t0) / 1e9;
   if (c.mode == FIG6_IN_WRITE)
-    printf("fig6 In-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
-           n_local, c.size);
+    printf("fig6 In-WRITE: %.2f Mops  n=%d nqp=%d size=%d\n", ops / sec / 1e6,
+           c.n, n_local, c.size);
   else if (c.mode == FIG6_OUT_SEND_UD)
-    printf("fig6 Out-SEND: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
-           n_local, c.size);
+    printf("fig6 Out-SEND: %.2f Mops  n=%d nqp=%d size=%d\n", ops / sec / 1e6,
+           c.n, n_local, c.size);
   else
-    printf("fig6 Out-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
-           n_local, c.size);
+    printf("fig6 Out-WRITE: %.2f Mops  n=%d nqp=%d size=%d\n", ops / sec / 1e6,
+           c.n, n_local, c.size);
 
   for (int i = 0; i < n_local; i++) {
     if (ahs[i])

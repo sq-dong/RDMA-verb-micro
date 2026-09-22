@@ -53,11 +53,12 @@ config is commented in `scripts/paper_config.sh` / `common.h`):
 | Fig. 3 | 4 … 4096 | powers of 2 to 4096 | **no** inline (DMA WRITE / READ) |
 | Fig. 4 | 4 … 4096 | powers of 2 + 828/956 cliff | WR-UC-INLINE ≤828; SEND-UD ≤956; WRITE-UC no |
 | Fig. 5 | (bars) | fixed **32** bytes | only `+inlined` bars |
-| Fig. 6 | 0 … 24 processes | `n = 1 2 4 6 … 24`, payload **32** B | all inlined |
+| Fig. 6 | 0 … 20 (paper N) | connected: **N² QPs**; UD: 1 QP | all inlined |
 
-`PAPER_INLINE_MAX=828` / `VT_MAX_INLINE=828` = mlx5_0 RC/UC grant;
-`PAPER_INLINE_MAX_UD=956` / `VT_MAX_INLINE_UD=956` for UD. Absolute Mops still
-differ from the paper (RoCE vs IB); compare curve *shape* (inline cliff, BW fall-off).
+**Inline create-time grant:** do **not** create QPs with the NIC's absolute
+max (~828 B). That inflates WQE size and destroys message rate (see
+`rdma_bench/libhrd/hrd.h` `HRD_MAX_INLINE 60`). Throughput paths use
+`vt_inline_grant(size)` — request only what the run needs.
 
 Each `collect_fig*.sh` writes CSV, plots PNG/PDF, then deletes `*.log` (keeps CSV and figures).
 
@@ -136,7 +137,7 @@ ConnectX-5 RoCE vs the paper's ConnectX-3 InfiniBand; compare curve *shape*.
 |------------|-----------|
 | UC | `fig3`: `--uc` / `--rc`; `fig4`: `-m write_uc`; echo WRITE path defaults to UC |
 | UD SEND | `fig4 -m send_ud`; `fig5 -m ws\|ss` |
-| inline | HW ceiling RC/UC **828 B**, UD **956 B**. Fig.2 `write_inl`+echo; Fig.4 WR-UC-INLINE/SEND-UD; Fig.5 `+inlined`; Fig.6 all. Fig.3 WRITE/READ and Fig.4 WRITE-UC: `--no-inline`. Old paper-256 soft cap is commented in `paper_config.sh` / `common.h` |
+| inline | Create QP with `vt_inline_grant(size)` (libhrd-style small WQE). HW ceiling RC/UC **828 B**, UD **956 B** is only for large Fig.2 sweeps. Fig.3 WRITE/READ and Fig.4 WRITE-UC: `--no-inline`. |
 | unsignaled / selective signaling | `-Q` (signal once every Q WRs) |
 | outstanding window | `-t` (postlist) or `fig5 -w` |
 | ECHO/2 | `fig2 -m echo` prints `rtt` and `rtt/2` |

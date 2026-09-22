@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Collect Fig.6 QP-scaling curves -> results/fig6.csv
 #
-# Paper: all-to-all among N processes ⇒ N QPs *per process* (N² in cluster).
-# We pass -q N (NOT N*N).  CX-5 needs larger N than CX-3 to thrash QP cache.
+# Paper: all-to-all among N processes ⇒ N² QPs at RNICS.
+# Binary takes -q N (paper's N) and creates N² connected QPs for
+# Out-WRITE / In-WRITE; Out-SEND-UD stays at 1 QP.
 #
 # Usage: ./scripts/collect_fig6.sh
 set -euo pipefail
@@ -19,7 +20,7 @@ csv_header "$CSV" "curve,n,mops"
 
 NQPS=("${PAPER_NQPS[@]}")
 SIZE=$PAPER_MSG_SIZE
-log "fig6 per-process QPs (=N); size=${SIZE}B inline+unsig=${PAPER_UNSIG_SCALE}"
+log "fig6 paper N (connected ⇒ N² QPs); size=${SIZE}B inline+unsig=${PAPER_UNSIG_SCALE}"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -33,25 +34,23 @@ run_fig6_pair() {
   local curve=$1
   local mode=$2
   local n=$3
-  local q=$n
-  # Out-SEND-UD always uses 1 QP inside the binary; -q only labels the axis.
   local port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig6 $curve n=$n mode=$mode"
+  log "fig6 $curve N=$n mode=$mode (connected QPs=$((n * n)))"
 
   local pass_log="$RESULTS_DIR/fig6_pass_${curve//\//_}_${n}.log"
   local req_log="$RESULTS_DIR/fig6_req_${curve//\//_}_${n}.log"
 
   local pass_host="$CLT_HOST"
   local req_host="${SRV_HOST:-local}"
-  local pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
-  local req_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
+  local pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -M $mode -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
+  local req_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -M $mode -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
 
   if [[ "$mode" == "in-write" ]]; then
     pass_host="${SRV_HOST:-local}"
     req_host="$CLT_HOST"
-    pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
-    req_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
+    pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -M $mode -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
+    req_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -M $mode -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
   fi
 
   pid=$(remote_bg "$pass_host" "$pass_log" "$pass_cmd")
@@ -77,7 +76,7 @@ run_fig6_pair() {
   mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
   [[ -n "$mops" ]] || { log "WARN parse $req_log"; return 0; }
   append_csv "$CSV" "$curve,$n,$mops"
-  log "fig6 $curve n=$n total=${mops} Mops"
+  log "fig6 $curve N=$n total=${mops} Mops"
 }
 
 for n in "${NQPS[@]}"; do

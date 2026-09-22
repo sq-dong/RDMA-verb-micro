@@ -62,12 +62,13 @@ void vt_open_device(struct vt_ctx *v, const char *dev_name, int port,
   struct ibv_port_attr pattr;
   VT_CHECK(ibv_query_port(v->ctx, (uint8_t)port, &pattr) == 0, "query_port");
   v->lid = pattr.lid;
+  v->active_mtu = pattr.active_mtu;
   v->is_roce = (pattr.link_layer == IBV_LINK_LAYER_ETHERNET);
   VT_CHECK(ibv_query_gid(v->ctx, (uint8_t)port, gid_index, &v->gid) == 0,
            "query_gid");
 
-  printf("vt: device=%s port=%d lid=%u roce=%d gid_index=%d\n", v->dev_name,
-         port, v->lid, v->is_roce, gid_index);
+  printf("vt: device=%s port=%d lid=%u roce=%d gid_index=%d active_mtu=%d\n",
+         v->dev_name, port, v->lid, v->is_roce, gid_index, (int)v->active_mtu);
 }
 
 void vt_close_device(struct vt_ctx *v) {
@@ -93,7 +94,7 @@ void vt_alloc_buf(struct vt_ctx *v, size_t size, int access) {
 }
 
 struct ibv_qp *vt_create_qp(struct vt_ctx *v, enum ibv_qp_type type,
-                            int max_inline) {
+                            int max_inline, int *actual_inline, int *actual_sq) {
   struct ibv_qp_init_attr attr;
   memset(&attr, 0, sizeof(attr));
   attr.send_cq = v->cq;
@@ -110,9 +111,28 @@ struct ibv_qp *vt_create_qp(struct vt_ctx *v, enum ibv_qp_type type,
   } else if (max_inline > VT_MAX_INLINE) {
     max_inline = VT_MAX_INLINE;
   }
+  if (max_inline < 0)
+    max_inline = VT_INLINE_WQE;
   attr.cap.max_inline_data = (uint32_t)max_inline;
   struct ibv_qp *qp = ibv_create_qp(v->pd, &attr);
   VT_CHECK(qp, "ibv_create_qp");
+  /*
+   * Driver may shrink SQ depth when WQEs are large. Selective signaling
+   * needs SQ >= 2 * unsig_batch (rdma_bench rule).
+   */
+  if (actual_inline)
+    *actual_inline = (int)attr.cap.max_inline_data;
+  if (actual_sq)
+    *actual_sq = (int)attr.cap.max_send_wr;
+  if ((int)attr.cap.max_inline_data < max_inline) {
+    fprintf(stderr, "vt: WARN inline grant %u < requested %d\n",
+            attr.cap.max_inline_data, max_inline);
+  }
+  if ((int)attr.cap.max_send_wr < VT_SQ_DEPTH) {
+    fprintf(stderr, "vt: WARN SQ depth shrunk to %u (requested %d); "
+                    "reduce max_inline / postlist\n",
+            attr.cap.max_send_wr, VT_SQ_DEPTH);
+  }
   return qp;
 }
 
@@ -159,7 +179,8 @@ void vt_qp_to_rtr(struct vt_ctx *v, struct ibv_qp *qp,
   struct ibv_qp_attr attr;
   memset(&attr, 0, sizeof(attr));
   attr.qp_state = IBV_QPS_RTR;
-  attr.path_mtu = IBV_MTU_1024;
+  /* Match libhrd (IBV_MTU_4096) / port active MTU — never hardcode 1024. */
+  attr.path_mtu = v->active_mtu ? v->active_mtu : IBV_MTU_4096;
   attr.dest_qp_num = remote->qpn;
   attr.rq_psn = remote->psn;
   attr.max_dest_rd_atomic = (type == IBV_QPT_RC) ? 16 : 0;

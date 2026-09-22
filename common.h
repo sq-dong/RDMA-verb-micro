@@ -3,29 +3,6 @@
  *
  * Inspired by rdma_bench/libhrd (hrd_conn.c, hrd.h) but without memcached:
  * we exchange QP metadata over a plain TCP socket instead of hrd_publish_*.
- *
- * Original libhrd-style registry path (kept for reference, not used here):
- *
- *   char srv_name[HRD_QP_NAME_SIZE];
- *   sprintf(srv_name, "server-%d", srv_gid);
- *   char clt_name[HRD_QP_NAME_SIZE];
- *   sprintf(clt_name, "client-%d", clt_gid);
- *
- *   hrd_publish_conn_qp(cb, 0, srv_name);
- *   printf("main: Server %s published. Waiting for client %s\n", srv_name,
- *          clt_name);
- *
- *   struct hrd_qp_attr *clt_qp = NULL;
- *   while (clt_qp == NULL) {
- *     clt_qp = hrd_get_published_qp(clt_name);
- *     if (clt_qp == NULL) {
- *       usleep(200000);
- *     }
- *   }
- *
- *   printf("main: Server %s found client! Connecting..\n", srv_name);
- *   hrd_connect_qp(cb, 0, clt_qp);
- *   hrd_publish_ready(srv_name);
  */
 
 #ifndef RDMA_VERB_TEST_COMMON_H
@@ -58,19 +35,35 @@
       VT_DIE(msg);                                                             \
   } while (0)
 
-/* Soft inline ceiling for RC/UC (= mlx5_0 ibv_create_qp grant).
- * Must match PAPER_INLINE_MAX in scripts/paper_config.sh.
- * OLD paper CX-3 soft cap was 256 (restore by setting VT_MAX_INLINE and
- * PAPER_INLINE_MAX back to 256; see commented blocks in paper_config.sh).
+/*
+ * Inline / WQE sizing — CRITICAL for message rate.
+ *
+ * rdma_bench/libhrd/hrd.h:
+ *   "Small max_inline_data reduces the QP's max WQE size, which reduces the
+ *    DMA size in doorbell method of WQE fetch."
+ *   #define HRD_MAX_INLINE 60
+ *
+ * Creating every QP with the NIC's absolute max (~828B on CX-5) makes WQEs
+ * enormous, shrinks effective SQ depth, and tanks outbound/ECHO Mops.
+ *
+ * Policy:
+ *   VT_INLINE_WQE   — default create-time grant (libhrd-style), keep WQEs small
+ *   VT_MAX_INLINE   — RC/UC hardware ceiling (for Fig.2 size sweeps only)
+ *   VT_MAX_INLINE_UD — UD hardware ceiling
+ *
+ * Throughput binaries (fig3–6) create with vt_inline_grant(size, ud):
+ *   no-inline runs → VT_INLINE_WQE
+ *   inline runs    → clamp(size, VT_INLINE_WQE .. HW max)
  */
+#define VT_INLINE_WQE 60
 #define VT_MAX_INLINE 828
-/* UD grant on same NIC (create UD QPs with this; do not use for RC/UC). */
 #define VT_MAX_INLINE_UD 956
-#define VT_BUF_SIZE (2 * 1024 * 1024)
+
+#define VT_BUF_SIZE (8 * 1024 * 1024)
 #define VT_SQ_DEPTH 128
-#define VT_RQ_DEPTH 128
-#define VT_CQ_DEPTH 256
-#define VT_MAX_QPS 512 /* Fig.6: -q N per process; CX-5 needs large N to thrash */
+#define VT_RQ_DEPTH 512
+#define VT_CQ_DEPTH 1024
+#define VT_MAX_QPS 512
 #define VT_CACHELINE 64
 
 /* Endpoint advertised over TCP (mirrors fields in hrd_qp_attr). */
@@ -97,6 +90,7 @@ struct vt_ctx {
   int gid_index;
   int is_roce;
   uint16_t lid;
+  enum ibv_mtu active_mtu;
   union ibv_gid gid;
   char dev_name[64];
 };
@@ -115,8 +109,27 @@ void vt_open_device(struct vt_ctx *v, const char *dev_name, int port,
 void vt_close_device(struct vt_ctx *v);
 void vt_alloc_buf(struct vt_ctx *v, size_t size, int access);
 
+/*
+ * Create QP. max_inline is the *requested* create-time grant.
+ * Prefer vt_inline_grant() rather than VT_MAX_INLINE.
+ * On success, *actual_inline / *actual_sq (if non-NULL) report driver caps.
+ */
 struct ibv_qp *vt_create_qp(struct vt_ctx *v, enum ibv_qp_type type,
-                            int max_inline);
+                            int max_inline, int *actual_inline, int *actual_sq);
+
+/* Inline grant for this run: keep WQE small unless this size needs more. */
+static inline int vt_inline_grant(int msg_size, int use_inline, int is_ud) {
+  int hw = is_ud ? VT_MAX_INLINE_UD : VT_MAX_INLINE;
+  if (!use_inline || msg_size <= 0)
+    return VT_INLINE_WQE;
+  int need = msg_size;
+  if (need < VT_INLINE_WQE)
+    need = VT_INLINE_WQE;
+  if (need > hw)
+    need = hw;
+  return need;
+}
+
 void vt_fill_local_ep(struct vt_ctx *v, struct ibv_qp *qp, uint32_t psn,
                       struct vt_endpoint *ep);
 void vt_qp_to_init(struct ibv_qp *qp, int port);

@@ -1,17 +1,11 @@
 # paper_config.sh — Fig.2–6 shared measurement policy.
 #
-# CURRENT MODE: HW-native inline on this ConnectX-5 (mlx5_0), measured via
-# ibv_create_qp binary search:
-#   RC/UC max_inline_data ≈ 828 B
-#   UD     max_inline_data ≈ 956 B
-# Soft ceiling for RC/UC paths = PAPER_INLINE_MAX (= VT_MAX_INLINE in common.h).
-# UD paths may use PAPER_INLINE_MAX_UD.
+# Inline: PAPER_INLINE_MAX is the HW ceiling (CX-5 ≈828). Throughput paths
+# must NOT create QPs with that grant — use vt_inline_grant(size) so WQEs
+# stay small (libhrd HRD_MAX_INLINE=60). See common.h.
 #
-# Axis: extend past the paper's 1024/256 so CX-5 shows the message-rate → BW
-# cliff; inline curves still stop at the real HW inline grant.
-#
-# Per-figure inline ON/OFF (same roles as the paper, cliff at HW max):
-#   Fig.2  WRITE/READ: no inline; WR-INLINE + ECHO: inline ≤ RC max
+# Per-figure inline ON/OFF (same roles as the paper):
+#   Fig.2  WRITE/READ: no inline; WR-INLINE + ECHO: inline for that size
 #   Fig.3  WRITE/READ: no inline
 #   Fig.4  WR-UC-INLINE + SEND-UD: inline; WRITE-UC + READ: no inline
 #   Fig.5  only +inlined bars
@@ -19,7 +13,7 @@
 #
 # shellcheck shell=bash
 
-# ---- CURRENT (HW-native CX-5) ----
+# ---- HW ceiling (create-time grant is per-size via vt_inline_grant) ----
 PAPER_INLINE_MAX="${PAPER_INLINE_MAX:-828}"
 PAPER_INLINE_MAX_UD="${PAPER_INLINE_MAX_UD:-956}"
 
@@ -63,14 +57,15 @@ PAPER_SIZES_OUT=(4 8 16 32 64 128 256 512 828 956 1024 2048 4096)
 # even older paper-ish:
 # PAPER_SIZES_OUT=(4 8 16 32 64 128 192 256)
 
-# Fig.6 x-axis = QPs *per process* (paper N).  CX-3 thrashed by ~16;
-# CX-5 QP cache is much larger — extend until Out-WRITE drops.
+# Fig.6 x-axis = paper's N (client procs = server procs).
+# Connected modes create N² QPs (all-to-all at one NIC). Max N with
+# VT_MAX_QPS=512 is floor(sqrt(512))=22. Paper ticks to 16; extend a bit
+# for CX-5 which has a larger QP cache.
 # shellcheck disable=SC2034
-PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
-# previous (wrong N² attempt / dense low range):
+PAPER_NQPS=(1 2 4 8 12 16 20)
+# OLD (wrong: treated -q as QP count, not paper N):
+# PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
 # PAPER_NQPS=(1 2 4 6 8 10 12 14 16 18 20 22 24)
-# OLD paper ticks only:
-# PAPER_NQPS=(4 8 12 16)
 
 paper_assert_inline_sync() {
   local hdr="${BENCH_DIR:-.}/common.h"

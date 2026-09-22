@@ -133,7 +133,9 @@ static void run_onesided(struct cfg *c) {
   int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                IBV_ACCESS_REMOTE_READ;
   vt_alloc_buf(&v, VT_BUF_SIZE, access);
-  struct ibv_qp *qp = vt_create_qp(&v, qpt, VT_MAX_INLINE);
+  /* Request only the inline this size needs — not the full HW max. */
+  int inl = vt_inline_grant(c->size, do_inl, 0);
+  struct ibv_qp *qp = vt_create_qp(&v, qpt, inl, NULL, NULL);
   uint32_t psn = (uint32_t)(vt_ns() & 0xffffff);
   struct vt_endpoint local, remote;
   vt_fill_local_ep(&v, qp, psn, &local);
@@ -170,7 +172,7 @@ static void run_onesided(struct cfg *c) {
     wr.wr_id = 1;
     wr.opcode = do_read ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_SIGNALED;
-    if (do_inl && !do_read && c->size <= VT_MAX_INLINE)
+    if (do_inl && !do_read && c->size <= inl)
       wr.send_flags |= IBV_SEND_INLINE;
     wr.sg_list = &sge;
     wr.num_sge = 1;
@@ -223,13 +225,14 @@ static void run_echo(struct cfg *c) {
   /* Per-try flag wait; well above ~3us RTT, short enough to recover fast. */
   const int flag_timeout_us = 2000;
   const int max_tries = 64;
-  int use_inl = (c->size <= VT_MAX_INLINE);
+  int use_inl = 1;
+  int inl = vt_inline_grant(c->size, use_inl, 0);
 
   struct vt_ctx v;
   vt_open_device(&v, c->dev, 1, c->gid_index);
   int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
   vt_alloc_buf(&v, VT_BUF_SIZE, access);
-  struct ibv_qp *qp = vt_create_qp(&v, qpt, VT_MAX_INLINE);
+  struct ibv_qp *qp = vt_create_qp(&v, qpt, inl, NULL, NULL);
   uint32_t psn = (uint32_t)(vt_ns() & 0xffffff);
   struct vt_endpoint local, remote;
   vt_fill_local_ep(&v, qp, psn, &local);
@@ -270,7 +273,7 @@ static void run_echo(struct cfg *c) {
       sge.lkey = v.mr->lkey;
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.send_flags = 0;
-      if (use_inl)
+      if (use_inl && c->size <= inl)
         wr.send_flags |= IBV_SEND_INLINE;
       if (vt_should_signal(nb++, 64))
         wr.send_flags |= IBV_SEND_SIGNALED;
@@ -315,7 +318,7 @@ static void run_echo(struct cfg *c) {
       sge.lkey = v.mr->lkey;
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.send_flags = 0;
-      if (use_inl)
+      if (use_inl && c->size <= inl)
         wr.send_flags |= IBV_SEND_INLINE;
       int sig = vt_should_signal(nb++, 64);
       if (sig)
