@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Collect Fig.6 QP-scaling curves -> results/fig6.csv
-# Paper x-axis N (processes): all-to-all => N*N active QPs per machine.
+#
+# Paper: all-to-all among N processes ⇒ N QPs *per process* (N² in cluster).
+# We pass -q N (NOT N*N).  CX-5 needs larger N than CX-3 to thrash QP cache.
+#
 # Usage: ./scripts/collect_fig6.sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +19,7 @@ csv_header "$CSV" "curve,n,mops"
 
 NQPS=("${PAPER_NQPS[@]}")
 SIZE=$PAPER_MSG_SIZE
-log "fig6 N*N QPs (cap ${VT_MAX_QPS:-256}); size=${SIZE}B inline+unsig"
+log "fig6 per-process QPs (=N); size=${SIZE}B inline+unsig=${PAPER_UNSIG_SCALE}"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -26,24 +29,15 @@ sleep 1
 PORT_BASE=18540
 idx=0
 
-fig6_nqp() {
-  local n=$1
-  local q=$((n * n))
-  if [[ $q -gt 256 ]]; then
-    q=256
-  fi
-  echo "$q"
-}
-
 run_fig6_pair() {
   local curve=$1
   local mode=$2
   local n=$3
-  local q
-  q=$(fig6_nqp "$n")
+  local q=$n
+  # Out-SEND-UD always uses 1 QP inside the binary; -q only labels the axis.
   local port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig6 $curve label_n=$n nqp=$q mode=$mode"
+  log "fig6 $curve n=$n mode=$mode"
 
   local pass_log="$RESULTS_DIR/fig6_pass_${curve//\//_}_${n}.log"
   local req_log="$RESULTS_DIR/fig6_req_${curve//\//_}_${n}.log"
@@ -83,7 +77,7 @@ run_fig6_pair() {
   mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
   [[ -n "$mops" ]] || { log "WARN parse $req_log"; return 0; }
   append_csv "$CSV" "$curve,$n,$mops"
-  log "fig6 $curve n=$n nqp=$q total=${mops} Mops"
+  log "fig6 $curve n=$n total=${mops} Mops"
 }
 
 for n in "${NQPS[@]}"; do

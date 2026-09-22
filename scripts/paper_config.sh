@@ -63,12 +63,12 @@ PAPER_SIZES_OUT=(4 8 16 32 64 128 256 512 828 956 1024 2048 4096)
 # even older paper-ish:
 # PAPER_SIZES_OUT=(4 8 16 32 64 128 192 256)
 
+# Fig.6 x-axis = QPs *per process* (paper N).  CX-3 thrashed by ~16;
+# CX-5 QP cache is much larger — extend until Out-WRITE drops.
 # shellcheck disable=SC2034
-PAPER_NQPS=(1 2 4 6 8 10 12 14 16 18 20 22 24)
-# previous:
-# PAPER_NQPS=(2 4 8 12 16)
-# denser mid-range only:
-# PAPER_NQPS=(1 2 4 6 8 10 12 14 16)
+PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
+# previous (wrong N² attempt / dense low range):
+# PAPER_NQPS=(1 2 4 6 8 10 12 14 16 18 20 22 24)
 # OLD paper ticks only:
 # PAPER_NQPS=(4 8 12 16)
 

@@ -1,15 +1,18 @@
 /*
- * fig6_scale.c — HERD Sec.3 Fig.6: all-to-all QP scaling (32 B, inlined).
+ * fig6_scale.c — HERD Sec.3 Fig.6: UC WRITE / UD SEND vs number of QPs.
  *
- * Paper x-axis N = number of client/server processes. All-to-all gives N*N
- * active QPs per machine. collect_fig6.sh passes -q N*N (capped at VT_MAX_QPS).
+ * Paper: all-to-all among N processes ⇒ N² QPs in the *cluster*, but each
+ * process only owns N QPs.  The NIC-cache pressure knob is therefore -q N
+ * (NOT N*N).  ConnectX-3 thrashed by N≈16; CX-5 needs much larger N.
+ *
+ * Template: rdma_bench/sender-scalability/main.cc
+ *   - one CQ *per* QP (shared CQ + many QPs corrupts signaling / overflows)
+ *   - unsig batch 4, inline WRITE, random QP pick
  *
  * Modes (-M):
- *   out-write   server -> client UC WRITE (drops with QP count)
- *   in-write    client -> server UC WRITE (stays high)
- *   out-send-ud server -> client UD SEND (stays high)
- *
- * Template: rdma_bench/sender-scalability/main.cc (+ ws-echo UD for send path)
+ *   out-write     server → client UC WRITE across N QPs (drops with N)
+ *   in-write      client → server UC WRITE across N QPs (stays high)
+ *   out-send-ud   server → client UD SEND on *1* QP (flat by design)
  */
 
 #include "common.h"
@@ -128,6 +131,29 @@ static void parse(int argc, char **argv, struct cfg *c) {
   }
 }
 
+static struct ibv_qp *create_qp_on_cq(struct vt_ctx *v, struct ibv_cq *cq,
+                                      enum ibv_qp_type type, int max_inline) {
+  struct ibv_qp_init_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.send_cq = cq;
+  attr.recv_cq = cq;
+  attr.qp_type = type;
+  attr.cap.max_send_wr = VT_SQ_DEPTH;
+  attr.cap.max_recv_wr = VT_RQ_DEPTH;
+  attr.cap.max_send_sge = 1;
+  attr.cap.max_recv_sge = 1;
+  if (type == IBV_QPT_UD) {
+    if (max_inline > VT_MAX_INLINE_UD)
+      max_inline = VT_MAX_INLINE_UD;
+  } else if (max_inline > VT_MAX_INLINE) {
+    max_inline = VT_MAX_INLINE;
+  }
+  attr.cap.max_inline_data = (uint32_t)max_inline;
+  struct ibv_qp *qp = ibv_create_qp(v->pd, &attr);
+  VT_CHECK(qp, "ibv_create_qp");
+  return qp;
+}
+
 static void ud_post_recv(struct ibv_qp *qp, struct vt_ctx *v, uint64_t id) {
   struct ibv_sge sge = {.addr = (uintptr_t)v->buf,
                         .length = (uint32_t)v->buf_size,
@@ -137,20 +163,13 @@ static void ud_post_recv(struct ibv_qp *qp, struct vt_ctx *v, uint64_t id) {
   VT_CHECK(ibv_post_recv(qp, &wr, &bad) == 0, "post_recv");
 }
 
-static void ud_passive_loop(struct ibv_qp **qps, struct vt_ctx *v, int nqp) {
-  for (int i = 0; i < nqp; i++)
-    ud_post_recv(qps[i], v, (uint64_t)i);
-  for (;;) {
-    struct ibv_wc wc[32];
-    int n = ibv_poll_cq(v->cq, 32, wc);
-    for (int i = 0; i < n; i++) {
-      if (wc[i].status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "wc %s\n", ibv_wc_status_str(wc[i].status));
-        exit(1);
-      }
-      if (wc[i].opcode & IBV_WC_RECV)
-        ud_post_recv(qps[(int)wc[i].wr_id], v, wc[i].wr_id);
-    }
+static void poll_one(struct ibv_cq *cq) {
+  struct ibv_wc wc;
+  while (ibv_poll_cq(cq, 1, &wc) == 0)
+    ;
+  if (wc.status != IBV_WC_SUCCESS) {
+    fprintf(stderr, "wc %s\n", ibv_wc_status_str(wc.status));
+    exit(1);
   }
 }
 
@@ -170,6 +189,14 @@ int main(int argc, char **argv) {
   parse(argc, argv, &c);
 
   const int is_ud = (c.mode == FIG6_OUT_SEND_UD);
+  /*
+   * Out-SEND-UD: paper keeps a flat curve because UD does not thrash the
+   * connected-QP cache.  Use 1 local UD QP (and 1 remote) regardless of -q.
+   * -q still labels the x-axis for the collect script.
+   */
+  const int n_local = is_ud ? 1 : c.nqp;
+  const int n_exch = is_ud ? 1 : c.nqp;
+
   enum ibv_qp_type qpt =
       is_ud ? IBV_QPT_UD : (c.use_uc ? IBV_QPT_UC : IBV_QPT_RC);
   const int inl_cap = is_ud ? VT_MAX_INLINE_UD : VT_MAX_INLINE;
@@ -180,14 +207,18 @@ int main(int argc, char **argv) {
                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                    IBV_ACCESS_REMOTE_READ);
 
+  struct ibv_cq *cqs[VT_MAX_QPS];
   struct ibv_qp *qps[VT_MAX_QPS];
   struct vt_endpoint locals[VT_MAX_QPS], remotes[VT_MAX_QPS];
   struct ibv_ah *ahs[VT_MAX_QPS];
   uint32_t psns[VT_MAX_QPS];
   memset(ahs, 0, sizeof(ahs));
+  memset(cqs, 0, sizeof(cqs));
 
-  for (int i = 0; i < c.nqp; i++) {
-    qps[i] = vt_create_qp(&v, qpt, inl_cap);
+  for (int i = 0; i < n_local; i++) {
+    cqs[i] = ibv_create_cq(v.ctx, VT_CQ_DEPTH, NULL, NULL, 0);
+    VT_CHECK(cqs[i], "ibv_create_cq");
+    qps[i] = create_qp_on_cq(&v, cqs[i], qpt, inl_cap);
     psns[i] = (uint32_t)((vt_ns() + (uint64_t)i * 9973) & 0xffffff);
     vt_fill_local_ep(&v, qps[i], psns[i], &locals[i]);
     locals[i].addr = (uint64_t)(uintptr_t)(v.buf + (size_t)i * 4096);
@@ -196,11 +227,11 @@ int main(int argc, char **argv) {
 
   int fd = c.is_server ? vt_tcp_listen(c.ip, c.port)
                        : vt_tcp_connect(c.ip, c.port);
-  for (int i = 0; i < c.nqp; i++)
+  for (int i = 0; i < n_exch; i++)
     vt_tcp_exchange(fd, &locals[i], &remotes[i]);
   close(fd);
 
-  for (int i = 0; i < c.nqp; i++) {
+  for (int i = 0; i < n_local; i++) {
     vt_qp_to_rtr(&v, qps[i], &remotes[i], qpt);
     vt_qp_to_rts(qps[i], psns[i]);
     if (is_ud) {
@@ -211,10 +242,24 @@ int main(int argc, char **argv) {
   }
 
   if (!i_am_sender(&c)) {
-    const char *role = is_ud ? "UD RECV" : "UC passive";
-    printf("fig6 passive %s nqp=%d mode=%d\n", role, c.nqp, (int)c.mode);
-    if (is_ud)
-      ud_passive_loop(qps, &v, c.nqp);
+    printf("fig6 passive nqp=%d mode=%d\n", n_local, (int)c.mode);
+    fflush(stdout);
+    if (is_ud) {
+      for (int r = 0; r < VT_RQ_DEPTH / 2; r++)
+        ud_post_recv(qps[0], &v, (uint64_t)r);
+      for (;;) {
+        struct ibv_wc wc[16];
+        int n = ibv_poll_cq(cqs[0], 16, wc);
+        for (int i = 0; i < n; i++) {
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "wc %s\n", ibv_wc_status_str(wc[i].status));
+            exit(1);
+          }
+          if (wc[i].opcode & IBV_WC_RECV)
+            ud_post_recv(qps[0], &v, wc[i].wr_id);
+        }
+      }
+    }
     pause();
     return 0;
   }
@@ -229,33 +274,37 @@ int main(int argc, char **argv) {
   uint64_t t0 = vt_ns();
   uint64_t deadline = t0 + (uint64_t)c.duration * 1000000000ull;
 
+  /* Hot path mirrors sender-scalability: no memset of wr each iter. */
+  memset(&wr, 0, sizeof(wr));
+  memset(&sge, 0, sizeof(sge));
+  wr.num_sge = 1;
+  wr.sg_list = &sge;
+  wr.next = NULL;
+  sge.addr = (uintptr_t)v.buf;
+  sge.length = (uint32_t)c.size;
+  sge.lkey = v.mr->lkey;
+  if (is_ud) {
+    wr.opcode = IBV_WR_SEND;
+    wr.wr.ud.ah = ahs[0];
+    wr.wr.ud.remote_qpn = remotes[0].qpn;
+    wr.wr.ud.remote_qkey = 0x11111111;
+  } else {
+    wr.opcode = IBV_WR_RDMA_WRITE;
+  }
+
   while (vt_ns() < deadline) {
     seed ^= seed << 13;
     seed ^= seed >> 7;
     seed ^= seed << 17;
-    int qi = (int)(seed % (uint64_t)c.nqp);
+    int qi = is_ud ? 0 : (int)(seed % (uint64_t)n_local);
 
-    memset(&wr, 0, sizeof(wr));
-    memset(&sge, 0, sizeof(sge));
-    wr.num_sge = 1;
-    wr.sg_list = &sge;
-    wr.send_flags =
-        vt_should_signal(nb_tx[qi], c.unsig) ? IBV_SEND_SIGNALED : 0;
-    if (vt_should_signal(nb_tx[qi], c.unsig) && nb_tx[qi] > 0)
-      vt_poll_cq(v.cq, 1);
+    wr.send_flags = (nb_tx[qi] % (uint64_t)c.unsig == 0) ? IBV_SEND_SIGNALED : 0;
+    if (nb_tx[qi] % (uint64_t)c.unsig == 0 && nb_tx[qi] > 0)
+      poll_one(cqs[qi]);
     if (c.use_inline && c.size <= inl_cap)
       wr.send_flags |= IBV_SEND_INLINE;
-    sge.addr = (uintptr_t)v.buf;
-    sge.length = (uint32_t)c.size;
-    sge.lkey = v.mr->lkey;
 
-    if (is_ud) {
-      wr.opcode = IBV_WR_SEND;
-      wr.wr.ud.ah = ahs[qi];
-      wr.wr.ud.remote_qpn = remotes[qi].qpn;
-      wr.wr.ud.remote_qkey = 0x11111111;
-    } else {
-      wr.opcode = IBV_WR_RDMA_WRITE;
+    if (!is_ud) {
       wr.wr.rdma.remote_addr = remotes[qi].addr;
       wr.wr.rdma.rkey = remotes[qi].rkey;
     }
@@ -267,19 +316,20 @@ int main(int argc, char **argv) {
 
   double sec = (vt_ns() - t0) / 1e9;
   if (c.mode == FIG6_IN_WRITE)
-    printf("fig6 In-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6, c.nqp,
-           c.size);
+    printf("fig6 In-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
+           n_local, c.size);
   else if (c.mode == FIG6_OUT_SEND_UD)
-    printf("fig6 Out-SEND: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6, c.nqp,
-           c.size);
+    printf("fig6 Out-SEND: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
+           n_local, c.size);
   else
-    printf("fig6 Out-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6, c.nqp,
-           c.size);
+    printf("fig6 Out-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6,
+           n_local, c.size);
 
-  for (int i = 0; i < c.nqp; i++) {
+  for (int i = 0; i < n_local; i++) {
     if (ahs[i])
       ibv_destroy_ah(ahs[i]);
     ibv_destroy_qp(qps[i]);
+    ibv_destroy_cq(cqs[i]);
   }
   vt_close_device(&v);
   return 0;
