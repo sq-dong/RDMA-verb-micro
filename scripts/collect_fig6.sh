@@ -23,7 +23,7 @@ csv_header "$CSV" "curve,n,mops"
 NQPS=("${PAPER_NQPS[@]}")
 SIZE=$PAPER_MSG_SIZE
 PL=$PAPER_POSTLIST
-log "fig6 paper-N all-to-all (QPs=N*N); size=${SIZE}B postlist=$PL unsig=${PAPER_UNSIG_SCALE}"
+log "fig6 paper-N: Out-WRITE QPs=N*N, In-WRITE QPs=N, Out-SEND QPs=1; size=${SIZE}B postlist=$PL unsig=${PAPER_UNSIG_SCALE}"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -36,8 +36,16 @@ idx=0
 fig6_nqp() {
   local n=$1
   local mode=$2
+  # Paper: N processes × N QPs each ⇒ N² QPs on the NIC for connected WRITE.
+  # In-WRITE must NOT put N² QPs on the single requester thread — that measures
+  # *outbound* cache pressure on the client (looks like Out-WRITE).  One paper
+  # client process only owns N QPs; use -q N so inbound at the server stays flat.
   if [[ "$mode" == "out-send-ud" ]]; then
     echo 1
+    return
+  fi
+  if [[ "$mode" == "in-write" ]]; then
+    echo "$n"
     return
   fi
   local q=$((n * n))

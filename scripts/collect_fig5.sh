@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Collect Fig.5 ECHO bars (32B) -> results/fig5.csv
 # Paper bars: SEND/SEND, WR/WR, WR/SEND × {basic, +unreliable, +unsignalled, +inlined}
+#
+# Notes vs rdma_bench/{ww,ws,ss}-echo:
+#   - ww-echo always inlines; we still sweep --no-inline for the first 3 bars.
+#   - ws-echo uses NUM_WORKERS=5 + multi-client; this collector is 1:1 (one
+#     client ↔ one server thread). Absolute WR/SEND and SEND/SEND Mops are
+#     therefore much lower than the paper; relative bar order is what we check.
+#   - Each bar = median of PAPER_FIG5_TRIALS runs (short echo runs are noisy).
+#
 # Usage: ./scripts/collect_fig5.sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,23 +25,73 @@ csv_header "$CSV" "echo_type,opt,mops"
 SIZE=$PAPER_MSG_SIZE
 WINDOW=$PAPER_ECHO_WINDOW
 DURATION=$PAPER_TPUT_SEC
-log "fig5 size=${SIZE}B window=$WINDOW (inline only on +inlined bars)"
+TRIALS=$PAPER_FIG5_TRIALS
+log "fig5 size=${SIZE}B window=$WINDOW trials=$TRIALS unsig=$PAPER_UNSIG_ECHO (inline only on +inlined)"
 
 # echo_type|binary_mode|opt_name|extra_flags
 declare -a JOBS=(
   "SEND/SEND|ss|basic|--rc --no-inline -Q 1"
   "SEND/SEND|ss|+unreliable|--no-inline -Q 1"
-  "SEND/SEND|ss|+unsignalled|--no-inline -Q $PAPER_UNSIG"
-  "SEND/SEND|ss|+inlined|-Q $PAPER_UNSIG"
+  "SEND/SEND|ss|+unsignalled|--no-inline -Q $PAPER_UNSIG_ECHO"
+  "SEND/SEND|ss|+inlined|-Q $PAPER_UNSIG_ECHO"
   "WR/WR|ww|basic|--rc --no-inline -Q 1"
   "WR/WR|ww|+unreliable|--no-inline -Q 1"
-  "WR/WR|ww|+unsignalled|--no-inline -Q $PAPER_UNSIG"
-  "WR/WR|ww|+inlined|-Q $PAPER_UNSIG"
+  "WR/WR|ww|+unsignalled|--no-inline -Q $PAPER_UNSIG_ECHO"
+  "WR/WR|ww|+inlined|-Q $PAPER_UNSIG_ECHO"
   "WR/SEND|ws|basic|--rc --no-inline -Q 1"
   "WR/SEND|ws|+unreliable|--no-inline -Q 1"
-  "WR/SEND|ws|+unsignalled|--no-inline -Q $PAPER_UNSIG"
-  "WR/SEND|ws|+inlined|-Q $PAPER_UNSIG"
+  "WR/SEND|ws|+unsignalled|--no-inline -Q $PAPER_UNSIG_ECHO"
+  "WR/SEND|ws|+inlined|-Q $PAPER_UNSIG_ECHO"
 )
+
+median_of() {
+  # stdin: one float per line → stdout: median
+  sort -n | awk '
+    { a[NR] = $1 }
+    END {
+      if (NR == 0) { print ""; exit }
+      if (NR % 2) print a[(NR + 1) / 2]
+      else printf "%.2f\n", (a[NR / 2] + a[NR / 2 + 1]) / 2
+    }'
+}
+
+run_one_trial() {
+  local etype=$1 mode=$2 opt=$3 flags=$4 port=$5 trial=$6
+  local srv_log clt_log srv_cmd clt_cmd pid rc line mops
+  srv_log="$RESULTS_DIR/fig5_srv_${etype//\//_}_${opt}_t${trial}.log"
+  clt_log="$RESULTS_DIR/fig5_clt_${etype//\//_}_${opt}_t${trial}.log"
+
+  srv_cmd="cd '$BENCH_DIR' && ./fig5_echo -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -m $mode -l $SIZE -w $WINDOW -D $((DURATION + 8)) $flags"
+  pid=$(remote_bg "${SRV_HOST:-local}" "$srv_log" "$srv_cmd")
+  sleep 1
+
+  clt_cmd="cd '$BENCH_DIR' && timeout $((DURATION + 25))s ./fig5_echo -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m $mode -l $SIZE -w $WINDOW -D $DURATION $flags"
+  set +e
+  remote "$CLT_HOST" "$clt_cmd" | tee "$clt_log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  kill_pid "$pid"
+  kill_bench "$SRV_HOST"
+  kill_bench "$CLT_HOST"
+  sleep 0.4
+
+  if [[ $rc -eq 124 ]]; then
+    log "WARN timeout $etype $opt trial=$trial"
+    return 1
+  fi
+  if [[ $rc -ne 0 ]]; then
+    log "WARN fail $etype $opt trial=$trial rc=$rc"
+    return 1
+  fi
+  line=$(grep -E '^fig5 .*ECHO:' "$clt_log" | tail -1 || true)
+  mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
+  if [[ -z "$mops" ]]; then
+    log "WARN parse $clt_log trial=$trial"
+    return 1
+  fi
+  echo "$mops"
+  return 0
+}
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -46,39 +104,26 @@ for job in "${JOBS[@]}"; do
   IFS='|' read -r etype mode opt flags <<<"$job"
   port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig5 $etype $opt mode=$mode"
+  log "fig5 $etype $opt mode=$mode (${TRIALS} trials)"
 
-  srv_log="$RESULTS_DIR/fig5_srv_${etype//\//_}_${opt}.log"
-  clt_log="$RESULTS_DIR/fig5_clt_${etype//\//_}_${opt}.log"
+  samples=""
+  t=0
+  while [[ $t -lt $TRIALS ]]; do
+    t=$((t + 1))
+    mops=$(run_one_trial "$etype" "$mode" "$opt" "$flags" "$port" "$t" || true)
+    if [[ -n "${mops:-}" ]]; then
+      samples+="${mops}"$'\n'
+      log "  trial $t: $mops Mops"
+    fi
+  done
 
-  srv_cmd="cd '$BENCH_DIR' && ./fig5_echo -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -m $mode -l $SIZE -w $WINDOW -D $((DURATION + 5)) $flags"
-  pid=$(remote_bg "${SRV_HOST:-local}" "$srv_log" "$srv_cmd")
-  sleep 1
-
-  # Client must return when -D expires. timeout is a backstop if a poll misses the deadline.
-  clt_cmd="cd '$BENCH_DIR' && timeout 30s ./fig5_echo -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m $mode -l $SIZE -w $WINDOW -D $DURATION $flags"
-  set +e
-  remote "$CLT_HOST" "$clt_cmd" | tee "$clt_log"
-  rc=${PIPESTATUS[0]}
-  set -e
-  kill_pid "$pid"
-  kill_bench "$SRV_HOST"
-  kill_bench "$CLT_HOST"
-  sleep 0.5
-
-  if [[ $rc -eq 124 ]]; then
-    log "WARN timeout $etype $opt"
+  med=$(printf '%s' "$samples" | median_of)
+  if [[ -z "$med" ]]; then
+    log "WARN no samples for $etype $opt"
     continue
   fi
-  [[ $rc -eq 0 ]] || { log "WARN fail $etype $opt rc=$rc"; continue; }
-  line=$(grep -E '^fig5 .*ECHO:' "$clt_log" | tail -1 || true)
-  mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
-  if [[ -z "$mops" ]]; then
-    log "WARN parse $clt_log; tail:"
-    tail -5 "$clt_log" 2>/dev/null || true
-    continue
-  fi
-  append_csv "$CSV" "$etype,$opt,$mops"
+  log "  median: $med Mops"
+  append_csv "$CSV" "$etype,$opt,$med"
 done
 
 nrows=$(grep -cve '^\s*$' "$CSV" || true)
@@ -88,6 +133,6 @@ if [[ "$nrows" -lt 13 ]]; then
   exit 1
 fi
 
-log "wrote $CSV ($((nrows - 1)) bars)"
+log "wrote $CSV ($((nrows - 1)) bars, median of $TRIALS)"
 python3 "$SCRIPT_DIR/plot_paper_figs.py" --fig 5 --results-dir "$RESULTS_DIR"
 cleanup_logs "$RESULTS_DIR"

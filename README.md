@@ -51,9 +51,9 @@ config is commented in `scripts/paper_config.sh` / `common.h`):
 |--------|--------|----------------|---------------|
 | Fig. 2 | 4 … 4096 | WRITE / READ: powers of 2 to 4096; WR-INLINE / ECHO: `…512,828` | only WR-INLINE + ECHO |
 | Fig. 3 | 4 … 4096 | powers of 2 to 4096 | **no** inline (DMA WRITE / READ) |
-| Fig. 4 | 4 … 4096 | powers of 2 + 828/956 cliff | WR-UC-INLINE ≤828; SEND-UD ≤956; WRITE-UC no |
-| Fig. 5 | (bars) | fixed **32** bytes | only `+inlined` bars |
-| Fig. 6 | 0 … 20 (paper N) | connected: **N² QPs**; UD: 1 QP | all inlined |
+| Fig. 4 | ≤828 denser mid-range | stop at RC inline cliff (paper: small INLINE WRITE > READ) | WR-UC-INLINE / SEND-UD inline; WRITE-UC / READ no |
+| Fig. 5 | (bars) | fixed **32** bytes; median of trials | only `+inlined` uses INLINE |
+| Fig. 6 | 0 … 16 (paper N) | Out-WRITE **N²** QPs; In-WRITE **N** QPs; UD: 1 QP | all inlined |
 
 **Inline create-time grant:** do **not** create QPs with the NIC's absolute
 max (~828 B). That inflates WQE size and destroys message rate (see

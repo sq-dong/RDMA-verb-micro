@@ -22,17 +22,23 @@ PAPER_INLINE_MAX_UD="${PAPER_INLINE_MAX_UD:-956}"
 # PAPER_INLINE_MAX_UD="${PAPER_INLINE_MAX_UD:-256}"
 
 PAPER_POSTLIST="${PAPER_POSTLIST:-64}"
+# Fig.2–4 / Fig.6: selective signaling must stay < VT_SQ_DEPTH (128).
+# unsig=256 with SQ=128 → ENOSPC before the first reclaim poll.
 PAPER_UNSIG="${PAPER_UNSIG:-64}"
-# Fig.6 with postlist: keep unsig >= postlist (one signal per doorbell batch).
-# PAPER_UNSIG_SCALE=4 is the paper/sender-scalability value for postlist=1.
+# Fig.5: ww/ws always signal the last WR of each window/postlist, so -Q only
+# needs to be >1 for "+unsignalled"; keep ≤ SQ/2. (ws-echo uses 256 with
+# HRD_Q_DEPTH=1024 — raise VT_SQ_DEPTH if matching that exactly.)
+PAPER_UNSIG_ECHO="${PAPER_UNSIG_ECHO:-64}"
+# Fig.6 with postlist: unsig >= postlist (one signal per doorbell batch).
 PAPER_UNSIG_SCALE="${PAPER_UNSIG_SCALE:-64}"
 
 PAPER_MSG_SIZE="${PAPER_MSG_SIZE:-32}"
-# ww-echo: win=64 beats 128 on CX-5 RoCE (post overhead vs RTT amplify)
 PAPER_ECHO_WINDOW="${PAPER_ECHO_WINDOW:-64}"
 
-PAPER_TPUT_SEC="${PAPER_TPUT_SEC:-3}"
-PAPER_PASSIVE_SEC="${PAPER_PASSIVE_SEC:-30}"
+PAPER_TPUT_SEC="${PAPER_TPUT_SEC:-5}"
+PAPER_PASSIVE_SEC="${PAPER_PASSIVE_SEC:-40}"
+# Fig.5: median of N independent trials (reduces short-run noise).
+PAPER_FIG5_TRIALS="${PAPER_FIG5_TRIALS:-3}"
 
 # Non-inline / READ / WRITE: into BW-limited region on 100G CX-5.
 # shellcheck disable=SC2034
@@ -50,15 +56,14 @@ PAPER_SIZES_INLINE=(4 8 16 32 64 128 256 512 828)
 # OLD:
 # PAPER_SIZES_INLINE=(4 8 16 32 64 128 256)
 
-# Fig.4 outbound sweep; inline curves filtered to ≤ PAPER_INLINE_MAX(_UD).
+# Fig.4 outbound: paper emphasizes small-payload INLINE WRITE > READ.
+# Cap at RC/UC HW inline ceiling (828); denser mid-range for PIO steps.
 # shellcheck disable=SC2034
-PAPER_SIZES_OUT=(4 8 16 32 64 128 256 512 828 956 1024 2048 4096)
-# denser (kept):
-# PAPER_SIZES_OUT=(4 8 16 32 48 64 96 128 192 256 320 384 512 640 768 828 956 1024 2048 4096)
-# OLD:
+PAPER_SIZES_OUT=(4 8 16 24 32 48 64 96 128 160 192 224 256 320 384 512 640 768 828)
+# previous (past inline cliff / BW region):
+# PAPER_SIZES_OUT=(4 8 16 32 64 128 256 512 828 956 1024 2048 4096)
+# OLD paper-ish:
 # PAPER_SIZES_OUT=(4 8 16 32 48 64 96 128 160 192 224 256)
-# even older paper-ish:
-# PAPER_SIZES_OUT=(4 8 16 32 64 128 192 256)
 
 # Fig.6 x-axis = paper N (#client procs = #server procs).
 # Active QPs at RNICS = N*N (all-to-all). Out-SEND-UD stays at 1 QP.

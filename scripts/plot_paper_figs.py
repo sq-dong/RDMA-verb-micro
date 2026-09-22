@@ -44,7 +44,9 @@ STYLE = {
 # HW-native payload axis (CX-5); old paper ticks kept as comment only.
 # TICKS_FIG2_3 = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
 DEFAULT_SIZES_FULL = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-DEFAULT_SIZES_OUT = [4, 8, 16, 32, 64, 128, 256, 512, 828, 956, 1024, 2048, 4096]
+DEFAULT_SIZES_OUT = [
+    4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 828
+]
 # denser defaults (kept):
 # DEFAULT_SIZES_FULL = [4, 8, 16, 32, 64, 128, 256, 512, 828, 1024, 2048, 4096]
 # DEFAULT_SIZES_OUT = [
