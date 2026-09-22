@@ -64,8 +64,10 @@ PAPER_SIZES_OUT=(4 8 16 32 64 128 256 512 828 956 1024 2048 4096)
 # PAPER_SIZES_OUT=(4 8 16 32 64 128 192 256)
 
 # shellcheck disable=SC2034
-PAPER_NQPS=(2 4 8 12 16)
-# denser (kept):
+PAPER_NQPS=(1 2 4 6 8 10 12 14 16 18 20 22 24)
+# previous:
+# PAPER_NQPS=(2 4 8 12 16)
+# denser mid-range only:
 # PAPER_NQPS=(1 2 4 6 8 10 12 14 16)
 # OLD paper ticks only:
 # PAPER_NQPS=(4 8 12 16)

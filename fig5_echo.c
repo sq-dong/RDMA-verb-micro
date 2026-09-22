@@ -353,11 +353,19 @@ done_ww:
 
 /*
  * WRITE request + UD SEND response (ws-echo / HERD).
- * Client: UC WRITE into server flag; poll RECV for response.
- * Server: poll flag; UD SEND response.
+ * Client: UC WRITE into per-slot flags; pipeline up to -w outstanding,
+ *         poll UD RECV for responses (paper postlist style — not 1-RTT ping-pong).
+ * Server: scan slots; UD SEND one response per request.
  */
 static void run_ws(struct cfg *c) {
   enum ibv_qp_type conn_t = c->use_uc ? IBV_QPT_UC : IBV_QPT_RC;
+  int win = c->window > 0 ? c->window : 1;
+  if (win > 64)
+    win = 64;
+  int stride = VT_CACHELINE;
+  while (stride < c->size)
+    stride += VT_CACHELINE;
+  VT_CHECK(stride * win <= (int)VT_BUF_SIZE, "ws window");
 
   struct vt_ctx v;
   vt_open_device(&v, c->dev, 1, c->gid_index);
@@ -365,9 +373,7 @@ static void run_ws(struct cfg *c) {
                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                    IBV_ACCESS_REMOTE_READ);
 
-  /* Connected QP for WRITE requests */
   struct ibv_qp *cqp = vt_create_qp(&v, conn_t, VT_MAX_INLINE);
-  /* Datagram QP for SEND responses */
   struct ibv_qp *dqp = vt_create_qp(&v, IBV_QPT_UD, VT_MAX_INLINE_UD);
 
   uint32_t cpsn = (uint32_t)(vt_ns() & 0xffffff);
@@ -381,7 +387,6 @@ static void run_ws(struct cfg *c) {
 
   int fd = c->is_server ? vt_tcp_listen(c->ip, c->port)
                         : vt_tcp_connect(c->ip, c->port);
-  /* Exchange connected then dgram endpoints (order fixed). */
   vt_tcp_exchange(fd, &clocal, &cremote);
   vt_tcp_exchange(fd, &dlocal, &dremote);
 
@@ -396,9 +401,9 @@ static void run_ws(struct cfg *c) {
   dvq.remote = dremote;
   vt_create_ud_ah(&v, &dvq);
 
-  volatile uint8_t *flag = v.buf;
-  *flag = 0;
-  uint8_t *payload = v.buf + VT_CACHELINE;
+  memset(v.buf, 0, VT_BUF_SIZE);
+  uint8_t *payload = v.buf + (size_t)stride * (size_t)win;
+  VT_CHECK((size_t)(payload - v.buf) + (size_t)c->size <= VT_BUF_SIZE, "ws buf");
   memset(payload, 1, (size_t)c->size);
 
   struct ibv_send_wr wr, *bad;
@@ -408,86 +413,104 @@ static void run_ws(struct cfg *c) {
   uint64_t deadline = t0 + (uint64_t)c->duration * 1000000000ull;
 
   if (c->is_server) {
-    printf("fig5 ws server (WRITE poll + UD SEND)\n");
+    printf("fig5 ws server window=%d size=%d\n", win, c->size);
     fflush(stdout);
     tcp_ready(fd, 1);
     close(fd);
     struct cq_credit cr = {0};
     uint64_t srv_deadline = deadline + 2000000000ull;
     while (vt_ns() < srv_deadline) {
-      while (*flag == 0) {
-        if (vt_ns() >= srv_deadline)
+      int got = 0;
+      for (int s = 0; s < win; s++) {
+        volatile uint8_t *slot = (volatile uint8_t *)(v.buf + stride * s);
+        if (*slot == 0)
+          continue;
+        *slot = 0;
+        got = 1;
+
+        int do_sig = vt_should_signal(nb_tx, c->unsig);
+        if (do_sig && reap_send(v.cq, NULL, &v, srv_deadline, &cr) != 0)
           goto done_ws;
+
+        memset(&wr, 0, sizeof(wr));
+        memset(&sge, 0, sizeof(sge));
+        wr.opcode = IBV_WR_SEND;
+        wr.num_sge = 1;
+        wr.sg_list = &sge;
+        wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
+        if (c->use_inline && c->size <= VT_MAX_INLINE_UD)
+          wr.send_flags |= IBV_SEND_INLINE;
+        wr.wr.ud.ah = dvq.ah;
+        wr.wr.ud.remote_qpn = dremote.qpn;
+        wr.wr.ud.remote_qkey = 0x11111111;
+        payload[0] = 1;
+        sge.addr = (uintptr_t)payload;
+        sge.length = (uint32_t)c->size;
+        sge.lkey = v.mr->lkey;
+        VT_CHECK(ibv_post_send(dqp, &wr, &bad) == 0, "ud send");
+        if (do_sig)
+          cr.signaled++;
+        nb_tx++;
+        echos++;
       }
-      *flag = 0;
-
-      int do_sig = vt_should_signal(nb_tx, c->unsig);
-      if (do_sig && reap_send(v.cq, NULL, &v, srv_deadline, &cr) != 0)
-        goto done_ws;
-
-      memset(&wr, 0, sizeof(wr));
-      memset(&sge, 0, sizeof(sge));
-      wr.opcode = IBV_WR_SEND;
-      wr.num_sge = 1;
-      wr.sg_list = &sge;
-      wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-      if (c->use_inline && c->size <= VT_MAX_INLINE_UD)
-        wr.send_flags |= IBV_SEND_INLINE;
-      wr.wr.ud.ah = dvq.ah;
-      wr.wr.ud.remote_qpn = dremote.qpn;
-      wr.wr.ud.remote_qkey = 0x11111111;
-      sge.addr = (uintptr_t)payload;
-      sge.length = (uint32_t)c->size;
-      sge.lkey = v.mr->lkey;
-      VT_CHECK(ibv_post_send(dqp, &wr, &bad) == 0, "ud send");
-      if (do_sig)
-        cr.signaled++;
-      nb_tx++;
-      echos++;
+      if (!got && vt_ns() >= srv_deadline)
+        break;
     }
   } else {
-    printf("fig5 ws client (UC WRITE + UD RECV)\n");
+    printf("fig5 ws client window=%d size=%d\n", win, c->size);
     fflush(stdout);
-    for (int i = 0; i < VT_RQ_DEPTH / 2; i++)
+    for (int i = 0; i < VT_RQ_DEPTH - 1; i++)
       post_one_recv(dqp, &v, (uint64_t)i);
     tcp_ready(fd, 0);
     close(fd);
 
     struct cq_credit cr = {0};
+    struct ibv_send_wr wrs[64];
+    struct ibv_sge sgls[64];
+    VT_CHECK(win <= 64, "ws win");
+    memset(v.buf, 0, (size_t)stride * (size_t)win);
+
     while (vt_ns() < deadline) {
-      *flag = 0;
-      payload[0] = 1;
-      int do_sig = vt_should_signal(nb_tx, c->unsig);
-      if (do_sig && reap_send(v.cq, dqp, &v, deadline, &cr) != 0)
-        break;
+      /* Reap prior signaled WRITEs before posting the next window. */
+      while (cr.signaled > cr.reaped) {
+        if (reap_send(v.cq, dqp, &v, deadline, &cr) != 0)
+          goto ws_client_done;
+      }
 
-      memset(&wr, 0, sizeof(wr));
-      memset(&sge, 0, sizeof(sge));
-      wr.opcode = IBV_WR_RDMA_WRITE;
-      wr.num_sge = 1;
-      wr.sg_list = &sge;
-      wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-      if (c->use_inline && c->size <= VT_MAX_INLINE)
-        wr.send_flags |= IBV_SEND_INLINE;
-      sge.addr = (uintptr_t)payload;
-      sge.length = (uint32_t)c->size;
-      sge.lkey = v.mr->lkey;
-      wr.wr.rdma.remote_addr = cremote.addr;
-      wr.wr.rdma.rkey = cremote.rkey;
-      VT_CHECK(ibv_post_send(cqp, &wr, &bad) == 0, "write");
-      if (do_sig)
-        cr.signaled++;
-      nb_tx++;
+      int batch_sig = 0;
+      for (int w = 0; w < win; w++) {
+        int do_sig = vt_should_signal(nb_tx, c->unsig);
+        memset(&wrs[w], 0, sizeof(wrs[w]));
+        memset(&sgls[w], 0, sizeof(sgls[w]));
+        wrs[w].opcode = IBV_WR_RDMA_WRITE;
+        wrs[w].num_sge = 1;
+        wrs[w].next = (w == win - 1) ? NULL : &wrs[w + 1];
+        wrs[w].sg_list = &sgls[w];
+        wrs[w].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
+        if (c->use_inline && c->size <= VT_MAX_INLINE)
+          wrs[w].send_flags |= IBV_SEND_INLINE;
+        payload[0] = 1;
+        sgls[w].addr = (uintptr_t)payload;
+        sgls[w].length = (uint32_t)c->size;
+        sgls[w].lkey = v.mr->lkey;
+        wrs[w].wr.rdma.remote_addr = cremote.addr + (uint64_t)(stride * w);
+        wrs[w].wr.rdma.rkey = cremote.rkey;
+        if (do_sig)
+          batch_sig++;
+        nb_tx++;
+      }
+      VT_CHECK(ibv_post_send(cqp, &wrs[0], &bad) == 0, "write window");
+      cr.signaled += (uint64_t)batch_sig;
 
-      uint64_t slice = vt_ns() + 2000000ull;
-      if (slice > deadline)
-        slice = deadline;
-      if (wait_recv(v.cq, dqp, &v, slice, &cr) != 1)
-        continue;
-      echos++;
+      for (int w = 0; w < win; w++) {
+        if (wait_recv(v.cq, dqp, &v, deadline, &cr) != 1)
+          goto ws_client_done;
+        echos++;
+      }
     }
+  ws_client_done:
     double sec = (vt_ns() - t0) / 1e9;
-    printf("fig5 ws ECHO: %.2f Mops\n", echos / sec / 1e6);
+    printf("fig5 ws ECHO: %.2f Mops (window=%d)\n", echos / sec / 1e6, win);
     fflush(stdout);
   }
 

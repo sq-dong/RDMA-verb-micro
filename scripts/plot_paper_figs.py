@@ -401,8 +401,7 @@ def plot_fig5(results: Path, demo: bool = False):
 
 def plot_fig6(results: Path, demo: bool = False):
     path = results / "fig6.csv"
-    measure = [2, 4, 8, 12, 16]
-    # denser: measure = [1, 2, 4, 6, 8, 10, 12, 14, 16]
+    measure = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24]
     if demo and not path.exists():
         rows = []
         for n in measure:
