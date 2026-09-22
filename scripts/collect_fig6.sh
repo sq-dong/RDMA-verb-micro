@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # Collect Fig.6 QP-scaling curves -> results/fig6.csv
-# Out-WRITE-UC via fig6_scale; Out-SEND-UD via fig4 -m send_ud with -q approximated
-# by repeating single-QP sender (UD needs no multi-QP). In-WRITE-UC via fig3
-# multi-client is approximated by fig6 inbound sketch if enabled later; here we
-# run Out-WRITE-UC fanout sweep and Out-SEND-UD (flat) for the paper's main story.
+# Paper x-axis N (processes): all-to-all => N*N active QPs per machine.
 # Usage: ./scripts/collect_fig6.sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +16,7 @@ csv_header "$CSV" "curve,n,mops"
 
 NQPS=("${PAPER_NQPS[@]}")
 SIZE=$PAPER_MSG_SIZE
-log "fig6 size=${SIZE}B inlined+unsignaled (paper); inline ceiling=${PAPER_INLINE_MAX}B"
+log "fig6 N*N QPs (cap ${VT_MAX_QPS:-256}); size=${SIZE}B inline+unsig"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -29,88 +26,74 @@ sleep 1
 PORT_BASE=18540
 idx=0
 
-# ---- Out-WRITE-UC fanout (inline UC WRITE, paper caption) ----
-for n in "${NQPS[@]}"; do
-  port=$((PORT_BASE + idx))
+fig6_nqp() {
+  local n=$1
+  local q=$((n * n))
+  if [[ $q -gt 256 ]]; then
+    q=256
+  fi
+  echo "$q"
+}
+
+run_fig6_pair() {
+  local curve=$1
+  local mode=$2
+  local n=$3
+  local q
+  q=$(fig6_nqp "$n")
+  local port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig6 Out-WRITE-UC nqp=$n"
+  log "fig6 $curve label_n=$n nqp=$q mode=$mode"
 
-  pass_log="$RESULTS_DIR/fig6_pass_write_$n.log"
-  req_log="$RESULTS_DIR/fig6_req_write_$n.log"
+  local pass_log="$RESULTS_DIR/fig6_pass_${curve//\//_}_${n}.log"
+  local req_log="$RESULTS_DIR/fig6_req_${curve//\//_}_${n}.log"
 
-  pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
-  pid=$(remote_bg "$CLT_HOST" "$pass_log" "$pass_cmd")
+  local pass_host="$CLT_HOST"
+  local req_host="${SRV_HOST:-local}"
+  local pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
+  local req_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
+
+  if [[ "$mode" == "in-write" ]]; then
+    pass_host="${SRV_HOST:-local}"
+    req_host="$CLT_HOST"
+    pass_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_PASSIVE_SEC"
+    req_cmd="cd '$BENCH_DIR' && ./fig6_scale -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -M $mode -q $q -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
+  fi
+
+  pid=$(remote_bg "$pass_host" "$pass_log" "$pass_cmd")
   sleep 1
 
-  req_cmd="cd '$BENCH_DIR' && ./fig6_scale -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -q $n -l $SIZE -Q $PAPER_UNSIG_SCALE -D $PAPER_TPUT_SEC"
   set +e
-  remote "${SRV_HOST:-local}" "$req_cmd" | tee "$req_log"
-  rc=${PIPESTATUS[0]}
-  set -e
-  kill_pid "$pid"
-  kill_bench "$CLT_HOST"
-  sleep 0.5
-
-  [[ $rc -eq 0 ]] || { log "WARN Out-WRITE n=$n"; continue; }
-  line=$(grep -E '^fig6 Out-WRITE:' "$req_log" | tail -1 || true)
-  mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
-  [[ -n "$mops" ]] || continue
-  append_csv "$CSV" "Out-WRITE-UC,$n,$mops"
-done
-
-# ---- Out-SEND-UD (inlined UD SEND; flat vs n) ----
-for n in "${NQPS[@]}"; do
-  port=$((PORT_BASE + idx))
-  idx=$((idx + 1))
-  log "fig6 Out-SEND-UD n=$n (single UD QP, inlined)"
-
-  pass_log="$RESULTS_DIR/fig6_pass_send_$n.log"
-  req_log="$RESULTS_DIR/fig6_req_send_$n.log"
-
-  pass_cmd="cd '$BENCH_DIR' && ./fig4_outbound -c -R -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -m send_ud -l $SIZE -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_PASSIVE_SEC"
-  pid=$(remote_bg "$CLT_HOST" "$pass_log" "$pass_cmd")
-  sleep 1
-
-  req_cmd="cd '$BENCH_DIR' && ./fig4_outbound -s -R -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -m send_ud -l $SIZE -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_TPUT_SEC"
-  set +e
-  remote "${SRV_HOST:-local}" "$req_cmd" | tee "$req_log"
-  rc=${PIPESTATUS[0]}
-  set -e
-  kill_pid "$pid"
-  kill_bench "$CLT_HOST"
-  sleep 0.5
-
-  [[ $rc -eq 0 ]] || { log "WARN Out-SEND n=$n"; continue; }
-  line=$(grep -E '^fig4 outbound:' "$req_log" | tail -1 || true)
-  mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
-  [[ -n "$mops" ]] || continue
-  append_csv "$CSV" "Out-SEND-UD,$n,$mops"
-done
-
-# ---- In-WRITE-UC: paper Fig.6 uses inlined UC WRITE (unlike Fig.3 DMA WRITE) ----
-for n in "${NQPS[@]}"; do
-  port=$((PORT_BASE + idx))
-  idx=$((idx + 1))
-  log "fig6 In-WRITE-UC label_n=$n (inlined ${SIZE}B UC)"
-
-  srv_log="$RESULTS_DIR/fig6_in_srv_$n.log"
-  clt_log="$RESULTS_DIR/fig6_in_clt_$n.log"
-  srv_cmd="cd '$BENCH_DIR' && ./fig3_inbound -s -d $SRV_DEV -a $SRV_IP -p $port -x $SRV_GID -l $SIZE --uc"
-  pid=$(remote_bg "${SRV_HOST:-local}" "$srv_log" "$srv_cmd")
-  sleep 1
-  clt_cmd="cd '$BENCH_DIR' && ./fig3_inbound -c -d $CLT_DEV -a $SRV_IP -p $port -x $CLT_GID -l $SIZE -t $PAPER_POSTLIST -Q $PAPER_UNSIG -D $PAPER_TPUT_SEC --uc"
-  set +e
-  remote "$CLT_HOST" "$clt_cmd" | tee "$clt_log"
+  remote "$req_host" "$req_cmd" | tee "$req_log"
   rc=${PIPESTATUS[0]}
   set -e
   kill_pid "$pid"
   kill_bench "$SRV_HOST"
+  kill_bench "$CLT_HOST"
   sleep 0.5
-  [[ $rc -eq 0 ]] || continue
-  line=$(grep -E '^fig3 inbound client:' "$clt_log" | tail -1 || true)
+
+  [[ $rc -eq 0 ]] || { log "WARN fail $curve n=$n"; return 0; }
+
+  local line mops
+  case "$mode" in
+    out-write) line=$(grep -E '^fig6 Out-WRITE:' "$req_log" | tail -1 || true) ;;
+    in-write)  line=$(grep -E '^fig6 In-WRITE:' "$req_log" | tail -1 || true) ;;
+    out-send-ud) line=$(grep -E '^fig6 Out-SEND:' "$req_log" | tail -1 || true) ;;
+  esac
   mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
-  [[ -n "$mops" ]] || continue
-  append_csv "$CSV" "In-WRITE-UC,$n,$mops"
+  [[ -n "$mops" ]] || { log "WARN parse $req_log"; return 0; }
+  append_csv "$CSV" "$curve,$n,$mops"
+  log "fig6 $curve n=$n nqp=$q total=${mops} Mops"
+}
+
+for n in "${NQPS[@]}"; do
+  run_fig6_pair "Out-WRITE-UC" "out-write" "$n"
+done
+for n in "${NQPS[@]}"; do
+  run_fig6_pair "Out-SEND-UD" "out-send-ud" "$n"
+done
+for n in "${NQPS[@]}"; do
+  run_fig6_pair "In-WRITE-UC" "in-write" "$n"
 done
 
 log "wrote $CSV"

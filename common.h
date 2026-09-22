@@ -70,7 +70,7 @@
 #define VT_SQ_DEPTH 128
 #define VT_RQ_DEPTH 128
 #define VT_CQ_DEPTH 256
-#define VT_MAX_QPS 64
+#define VT_MAX_QPS 256 /* Fig.6 all-to-all: N=16 => 256 QPs; old cap was 64 */
 #define VT_CACHELINE 64
 
 /* Endpoint advertised over TCP (mirrors fields in hrd_qp_attr). */

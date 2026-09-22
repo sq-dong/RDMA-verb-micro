@@ -1,22 +1,26 @@
 /*
- * fig6_scale.c — HERD Sec.3 Fig.6: UC WRITE vs many QPs (outbound focus).
+ * fig6_scale.c — HERD Sec.3 Fig.6: all-to-all QP scaling (32 B, inlined).
  *
- * Template: rdma_bench/sender-scalability/main.cc
- *   Server thread creates N QPs, each connected to a different client QP.
- *   Then randomly picks a client QP and issues inline unsignaled WRITEs.
+ * Paper x-axis N = number of client/server processes. All-to-all gives N*N
+ * active QPs per machine. collect_fig6.sh passes -q N*N (capped at VT_MAX_QPS).
  *
- * Paper also measures inbound all-to-all and Out-SEND-UD. Those paths are
- * sketched in comments below (not deleted) — this binary implements the
- * Out-WRITE-UC scaling curve that drops sharply with QP count.
+ * Modes (-M):
+ *   out-write   server -> client UC WRITE (drops with QP count)
+ *   in-write    client -> server UC WRITE (stays high)
+ *   out-send-ud server -> client UD SEND (stays high)
  *
- * -q N : number of QPs (= fanout). Paper uses N client procs => N^2 QPs at
- *        the server when all-to-all; here one process pair with N QPs is the
- *        same NIC-cache pressure knob.
+ * Template: rdma_bench/sender-scalability/main.cc (+ ws-echo UD for send path)
  */
 
 #include "common.h"
 
 #include <getopt.h>
+
+enum fig6_mode {
+  FIG6_OUT_WRITE = 0,
+  FIG6_IN_WRITE,
+  FIG6_OUT_SEND_UD,
+};
 
 struct cfg {
   int is_server;
@@ -30,14 +34,28 @@ struct cfg {
   int duration;
   int use_inline;
   int use_uc;
+  enum fig6_mode mode;
 };
 
 static void usage(const char *a) {
   fprintf(stderr,
-          "Usage: %s -s|-c -d DEV -a IP [-p PORT] [-q NQPS] [-l SIZE] "
-          "[-Q UNSIG] [-D SEC] [--no-inline] [--rc]\n",
+          "Usage: %s -s|-c -d DEV -a IP [-p PORT] [-M out-write|in-write|"
+          "out-send-ud] [-q NQPS] [-l SIZE] [-Q UNSIG] [-D SEC] "
+          "[--no-inline] [--rc]\n",
           a);
   exit(1);
+}
+
+static enum fig6_mode parse_mode(const char *s) {
+  if (!strcmp(s, "out-write"))
+    return FIG6_OUT_WRITE;
+  if (!strcmp(s, "in-write"))
+    return FIG6_IN_WRITE;
+  if (!strcmp(s, "out-send-ud"))
+    return FIG6_OUT_SEND_UD;
+  fprintf(stderr, "unknown mode %s\n", s);
+  usage("fig6_scale");
+  return FIG6_OUT_WRITE;
 }
 
 static void parse(int argc, char **argv, struct cfg *c) {
@@ -46,16 +64,17 @@ static void parse(int argc, char **argv, struct cfg *c) {
   c->gid_index = 3;
   c->size = 32;
   c->nqp = 16;
-  c->unsig = 4; /* sender-scalability default style: small unsig batch */
+  c->unsig = 4;
   c->duration = 5;
   c->use_inline = 1;
   c->use_uc = 1;
   c->is_server = -1;
+  c->mode = FIG6_OUT_WRITE;
   static struct option longopts[] = {{"no-inline", no_argument, 0, 1001},
                                      {"rc", no_argument, 0, 1002},
                                      {0, 0, 0, 0}};
   int opt;
-  while ((opt = getopt_long(argc, argv, "scd:a:p:x:l:q:Q:D:h", longopts,
+  while ((opt = getopt_long(argc, argv, "scd:a:p:x:l:q:Q:D:M:h", longopts,
                             NULL)) != -1) {
     switch (opt) {
     case 's':
@@ -88,6 +107,9 @@ static void parse(int argc, char **argv, struct cfg *c) {
     case 'D':
       c->duration = atoi(optarg);
       break;
+    case 'M':
+      c->mode = parse_mode(optarg);
+      break;
     case 1001:
       c->use_inline = 0;
       break;
@@ -106,10 +128,51 @@ static void parse(int argc, char **argv, struct cfg *c) {
   }
 }
 
+static void ud_post_recv(struct ibv_qp *qp, struct vt_ctx *v, uint64_t id) {
+  struct ibv_sge sge = {.addr = (uintptr_t)v->buf,
+                        .length = (uint32_t)v->buf_size,
+                        .lkey = v->mr->lkey};
+  struct ibv_recv_wr wr = {.wr_id = id, .sg_list = &sge, .num_sge = 1};
+  struct ibv_recv_wr *bad = NULL;
+  VT_CHECK(ibv_post_recv(qp, &wr, &bad) == 0, "post_recv");
+}
+
+static void ud_passive_loop(struct ibv_qp **qps, struct vt_ctx *v, int nqp) {
+  for (int i = 0; i < nqp; i++)
+    ud_post_recv(qps[i], v, (uint64_t)i);
+  for (;;) {
+    struct ibv_wc wc[32];
+    int n = ibv_poll_cq(v->cq, 32, wc);
+    for (int i = 0; i < n; i++) {
+      if (wc[i].status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "wc %s\n", ibv_wc_status_str(wc[i].status));
+        exit(1);
+      }
+      if (wc[i].opcode & IBV_WC_RECV)
+        ud_post_recv(qps[(int)wc[i].wr_id], v, wc[i].wr_id);
+    }
+  }
+}
+
+static int i_am_sender(const struct cfg *c) {
+  switch (c->mode) {
+  case FIG6_OUT_WRITE:
+  case FIG6_OUT_SEND_UD:
+    return c->is_server;
+  case FIG6_IN_WRITE:
+    return !c->is_server;
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   struct cfg c;
   parse(argc, argv, &c);
-  enum ibv_qp_type qpt = c.use_uc ? IBV_QPT_UC : IBV_QPT_RC;
+
+  const int is_ud = (c.mode == FIG6_OUT_SEND_UD);
+  enum ibv_qp_type qpt =
+      is_ud ? IBV_QPT_UD : (c.use_uc ? IBV_QPT_UC : IBV_QPT_RC);
+  const int inl_cap = is_ud ? VT_MAX_INLINE_UD : VT_MAX_INLINE;
 
   struct vt_ctx v;
   vt_open_device(&v, c.dev, 1, c.gid_index);
@@ -119,13 +182,14 @@ int main(int argc, char **argv) {
 
   struct ibv_qp *qps[VT_MAX_QPS];
   struct vt_endpoint locals[VT_MAX_QPS], remotes[VT_MAX_QPS];
+  struct ibv_ah *ahs[VT_MAX_QPS];
   uint32_t psns[VT_MAX_QPS];
+  memset(ahs, 0, sizeof(ahs));
 
   for (int i = 0; i < c.nqp; i++) {
-    qps[i] = vt_create_qp(&v, qpt, VT_MAX_INLINE);
+    qps[i] = vt_create_qp(&v, qpt, inl_cap);
     psns[i] = (uint32_t)((vt_ns() + (uint64_t)i * 9973) & 0xffffff);
     vt_fill_local_ep(&v, qps[i], psns[i], &locals[i]);
-    /* Per-QP remote buffer offset so WRITEs do not stomp each other. */
     locals[i].addr = (uint64_t)(uintptr_t)(v.buf + (size_t)i * 4096);
     vt_qp_to_init(qps[i], v.port);
   }
@@ -139,74 +203,23 @@ int main(int argc, char **argv) {
   for (int i = 0; i < c.nqp; i++) {
     vt_qp_to_rtr(&v, qps[i], &remotes[i], qpt);
     vt_qp_to_rts(qps[i], psns[i]);
+    if (is_ud) {
+      struct vt_qp vq = {.qp = qps[i], .remote = remotes[i]};
+      vt_create_ud_ah(&v, &vq);
+      ahs[i] = vq.ah;
+    }
   }
 
-  /*
-   * Inbound all-to-all (paper Fig.6 In-WRITE-UC) — not active; full sketch kept:
-   *
-   *   // Server side: stay passive (like fig3), do not post sends.
-   *   // if (c.is_server) {
-   *   //   printf("fig6 inbound passive server with %d QPs\n", c.nqp);
-   *   //   pause();
-   *   //   return 0;
-   *   // }
-   *   // Client side is the requester below.
-   *   uint64_t seed = 0xdeadbeefull;
-   *   uint64_t nb_tx_in[VT_MAX_QPS];
-   *   memset(nb_tx_in, 0, sizeof(nb_tx_in));
-   *   uint64_t ops_in = 0;
-   *   uint64_t t0_in = vt_ns();
-   *   uint64_t deadline_in = t0_in + (uint64_t)c.duration * 1000000000ull;
-   *   struct ibv_send_wr wr_in, *bad_in;
-   *   struct ibv_sge sge_in;
-   *   while (vt_ns() < deadline_in) {
-   *     seed ^= seed << 13;
-   *     seed ^= seed >> 7;
-   *     seed ^= seed << 17;
-   *     int qi = (int)(seed % (uint64_t)c.nqp);
-   *     memset(&wr_in, 0, sizeof(wr_in));
-   *     memset(&sge_in, 0, sizeof(sge_in));
-   *     wr_in.opcode = IBV_WR_RDMA_WRITE;
-   *     wr_in.num_sge = 1;
-   *     wr_in.sg_list = &sge_in;
-   *     wr_in.send_flags =
-   *         vt_should_signal(nb_tx_in[qi], c.unsig) ? IBV_SEND_SIGNALED : 0;
-   *     if (vt_should_signal(nb_tx_in[qi], c.unsig) && nb_tx_in[qi] > 0)
-   *       vt_poll_cq(v.cq, 1);
-   *     if (c.use_inline && c.size <= VT_MAX_INLINE)
-   *       wr_in.send_flags |= IBV_SEND_INLINE;
-   *     sge_in.addr = (uintptr_t)v.buf;
-   *     sge_in.length = (uint32_t)c.size;
-   *     sge_in.lkey = v.mr->lkey;
-   *     wr_in.wr.rdma.remote_addr = remotes[qi].addr;
-   *     wr_in.wr.rdma.rkey = remotes[qi].rkey;
-   *     VT_CHECK(ibv_post_send(qps[qi], &wr_in, &bad_in) == 0, "post");
-   *     nb_tx_in[qi]++;
-   *     ops_in++;
-   *   }
-   *   double sec_in = (vt_ns() - t0_in) / 1e9;
-   *   printf("fig6 In-WRITE: %.2f Mops  nqp=%d size=%d\n",
-   *          ops_in / sec_in / 1e6, c.nqp, c.size);
-   *
-   * Out-SEND-UD scaling — use fig4 -m send_ud with one UD QP (scales by design):
-   *
-   *   // ./fig4_outbound -s -R -d mlx5_0 -a 10.0.0.20 -p 18520 -m send_ud \
-   *   //     -l 32 -t 64 -Q 64 -D 5
-   *   // ./fig4_outbound -c -R -d mlx5_3 -a 10.0.0.20 -p 18520 -m send_ud \
-   *   //     -l 32 -t 64 -Q 64 -D 5
-   */
-
-  int i_am_sender = c.is_server; /* MS issues outbound WRITEs */
-  if (!i_am_sender) {
-    printf("fig6 passive client with %d QPs\n", c.nqp);
+  if (!i_am_sender(&c)) {
+    const char *role = is_ud ? "UD RECV" : "UC passive";
+    printf("fig6 passive %s nqp=%d mode=%d\n", role, c.nqp, (int)c.mode);
+    if (is_ud)
+      ud_passive_loop(qps, &v, c.nqp);
     pause();
     return 0;
   }
 
-  printf("fig6 outbound WRITE fanout=%d size=%d uc=%d\n", c.nqp, c.size,
-         c.use_uc);
   memset(v.buf, 1, VT_BUF_SIZE);
-
   struct ibv_send_wr wr, *bad;
   struct ibv_sge sge;
   uint64_t nb_tx[VT_MAX_QPS];
@@ -217,7 +230,6 @@ int main(int argc, char **argv) {
   uint64_t deadline = t0 + (uint64_t)c.duration * 1000000000ull;
 
   while (vt_ns() < deadline) {
-    /* xorshift pick QP — same spirit as sender-scalability random client. */
     seed ^= seed << 13;
     seed ^= seed >> 7;
     seed ^= seed << 17;
@@ -225,31 +237,50 @@ int main(int argc, char **argv) {
 
     memset(&wr, 0, sizeof(wr));
     memset(&sge, 0, sizeof(sge));
-    wr.opcode = IBV_WR_RDMA_WRITE;
     wr.num_sge = 1;
     wr.sg_list = &sge;
     wr.send_flags =
         vt_should_signal(nb_tx[qi], c.unsig) ? IBV_SEND_SIGNALED : 0;
     if (vt_should_signal(nb_tx[qi], c.unsig) && nb_tx[qi] > 0)
       vt_poll_cq(v.cq, 1);
-    if (c.use_inline && c.size <= VT_MAX_INLINE)
+    if (c.use_inline && c.size <= inl_cap)
       wr.send_flags |= IBV_SEND_INLINE;
     sge.addr = (uintptr_t)v.buf;
     sge.length = (uint32_t)c.size;
     sge.lkey = v.mr->lkey;
-    wr.wr.rdma.remote_addr = remotes[qi].addr;
-    wr.wr.rdma.rkey = remotes[qi].rkey;
+
+    if (is_ud) {
+      wr.opcode = IBV_WR_SEND;
+      wr.wr.ud.ah = ahs[qi];
+      wr.wr.ud.remote_qpn = remotes[qi].qpn;
+      wr.wr.ud.remote_qkey = 0x11111111;
+    } else {
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.wr.rdma.remote_addr = remotes[qi].addr;
+      wr.wr.rdma.rkey = remotes[qi].rkey;
+    }
+
     VT_CHECK(ibv_post_send(qps[qi], &wr, &bad) == 0, "post");
     nb_tx[qi]++;
     ops++;
   }
 
   double sec = (vt_ns() - t0) / 1e9;
-  printf("fig6 Out-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6, c.nqp,
-         c.size);
+  if (c.mode == FIG6_IN_WRITE)
+    printf("fig6 In-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6, c.nqp,
+           c.size);
+  else if (c.mode == FIG6_OUT_SEND_UD)
+    printf("fig6 Out-SEND: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6, c.nqp,
+           c.size);
+  else
+    printf("fig6 Out-WRITE: %.2f Mops  nqp=%d size=%d\n", ops / sec / 1e6, c.nqp,
+           c.size);
 
-  for (int i = 0; i < c.nqp; i++)
+  for (int i = 0; i < c.nqp; i++) {
+    if (ahs[i])
+      ibv_destroy_ah(ahs[i]);
     ibv_destroy_qp(qps[i]);
+  }
   vt_close_device(&v);
   return 0;
 }

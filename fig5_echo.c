@@ -465,48 +465,64 @@ static void run_ws(struct cfg *c) {
     close(fd);
 
     struct cq_credit cr = {0};
-    struct ibv_send_wr wrs[64];
-    struct ibv_sge sgls[64];
-    VT_CHECK(win <= 64, "ws win");
-    memset(v.buf, 0, (size_t)stride * (size_t)win);
+    uint64_t slot_seq = 0;
+    int stride_slot = 0;
 
     while (vt_ns() < deadline) {
-      /* Reap prior signaled WRITEs before posting the next window. */
+      /* Drain RECV/SEND CQEs without blocking for a full window. */
+      for (;;) {
+        struct ibv_wc wc;
+        int r = ibv_poll_cq(v.cq, 1, &wc);
+        if (r == 0)
+          break;
+        if (r < 0 || wc.status != IBV_WC_SUCCESS)
+          goto ws_client_done;
+        if (wc.opcode & IBV_WC_RECV) {
+          post_one_recv(dqp, &v, wc.wr_id);
+          echos++;
+        } else {
+          cr.reaped++;
+        }
+      }
       while (cr.signaled > cr.reaped) {
-        if (reap_send(v.cq, dqp, &v, deadline, &cr) != 0)
+        struct ibv_wc wc;
+        int r = ibv_poll_cq(v.cq, 1, &wc);
+        if (r == 0)
+          break;
+        if (r < 0 || wc.status != IBV_WC_SUCCESS)
           goto ws_client_done;
+        if (wc.opcode & IBV_WC_RECV) {
+          post_one_recv(dqp, &v, wc.wr_id);
+          echos++;
+        } else {
+          cr.reaped++;
+        }
       }
 
-      int batch_sig = 0;
-      for (int w = 0; w < win; w++) {
-        int do_sig = vt_should_signal(nb_tx, c->unsig);
-        memset(&wrs[w], 0, sizeof(wrs[w]));
-        memset(&sgls[w], 0, sizeof(sgls[w]));
-        wrs[w].opcode = IBV_WR_RDMA_WRITE;
-        wrs[w].num_sge = 1;
-        wrs[w].next = (w == win - 1) ? NULL : &wrs[w + 1];
-        wrs[w].sg_list = &sgls[w];
-        wrs[w].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
-        if (c->use_inline && c->size <= VT_MAX_INLINE)
-          wrs[w].send_flags |= IBV_SEND_INLINE;
+      int do_sig = vt_should_signal(nb_tx, c->unsig);
+      memset(&wr, 0, sizeof(wr));
+      memset(&sge, 0, sizeof(sge));
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.num_sge = 1;
+      wr.sg_list = &sge;
+      wr.send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
+      if (c->use_inline && c->size <= VT_MAX_INLINE)
+        wr.send_flags |= IBV_SEND_INLINE;
+      payload[0] = (uint8_t)(++slot_seq & 0xff);
+      if (payload[0] == 0)
         payload[0] = 1;
-        sgls[w].addr = (uintptr_t)payload;
-        sgls[w].length = (uint32_t)c->size;
-        sgls[w].lkey = v.mr->lkey;
-        wrs[w].wr.rdma.remote_addr = cremote.addr + (uint64_t)(stride * w);
-        wrs[w].wr.rdma.rkey = cremote.rkey;
-        if (do_sig)
-          batch_sig++;
-        nb_tx++;
-      }
-      VT_CHECK(ibv_post_send(cqp, &wrs[0], &bad) == 0, "write window");
-      cr.signaled += (uint64_t)batch_sig;
-
-      for (int w = 0; w < win; w++) {
-        if (wait_recv(v.cq, dqp, &v, deadline, &cr) != 1)
-          goto ws_client_done;
-        echos++;
-      }
+      sge.addr = (uintptr_t)payload;
+      sge.length = (uint32_t)c->size;
+      sge.lkey = v.mr->lkey;
+      wr.wr.rdma.remote_addr = cremote.addr + (uint64_t)(stride * stride_slot);
+      wr.wr.rdma.rkey = cremote.rkey;
+      VT_CHECK(ibv_post_send(cqp, &wr, &bad) == 0, "write");
+      if (do_sig)
+        cr.signaled++;
+      nb_tx++;
+      stride_slot++;
+      if (stride_slot >= win)
+        stride_slot = 0;
     }
   ws_client_done:
     double sec = (vt_ns() - t0) / 1e9;
