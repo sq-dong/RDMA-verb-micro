@@ -57,15 +57,12 @@ PAPER_SIZES_OUT=(4 8 16 32 64 128 256 512 828 956 1024 2048 4096)
 # even older paper-ish:
 # PAPER_SIZES_OUT=(4 8 16 32 64 128 192 256)
 
-# Fig.6 x-axis = paper's N (client procs = server procs).
-# Connected modes create N² QPs (all-to-all at one NIC). Max N with
-# VT_MAX_QPS=512 is floor(sqrt(512))=22. Paper ticks to 16; extend a bit
-# for CX-5 which has a larger QP cache.
+# Fig.6 x-axis = #QPs on the NIC (paper N=16 all-to-all ⇒ 256 QPs).
+# Out-SEND-UD ignores -q and stays at 1 QP.
 # shellcheck disable=SC2034
-PAPER_NQPS=(1 2 4 8 12 16 20)
-# OLD (wrong: treated -q as QP count, not paper N):
-# PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
-# PAPER_NQPS=(1 2 4 6 8 10 12 14 16 18 20 22 24)
+PAPER_NQPS=(1 2 4 8 16 32 64 128 256)
+# OLD wrong (treated -q as paper N and squared inside the binary):
+# PAPER_NQPS=(1 2 4 8 12 16 20)
 
 paper_assert_inline_sync() {
   local hdr="${BENCH_DIR:-.}/common.h"

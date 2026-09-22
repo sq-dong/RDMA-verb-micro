@@ -17,7 +17,7 @@ csv_header "$CSV" "echo_type,opt,mops"
 SIZE=$PAPER_MSG_SIZE
 WINDOW=$PAPER_ECHO_WINDOW
 DURATION=$PAPER_TPUT_SEC
-log "fig5 size=${SIZE}B window=$WINDOW (inline only on +inlined bars; ceiling=${PAPER_INLINE_MAX}B)"
+log "fig5 size=${SIZE}B window=$WINDOW (inline only on +inlined bars)"
 
 # echo_type|binary_mode|opt_name|extra_flags
 declare -a JOBS=(

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Collect Fig.6 QP-scaling curves -> results/fig6.csv
 #
-# Paper: all-to-all among N processes ⇒ N² QPs at RNICS.
-# Binary takes -q N (paper's N) and creates N² connected QPs for
-# Out-WRITE / In-WRITE; Out-SEND-UD stays at 1 QP.
+# -q = #QPs on the NIC (paper's N=16 all-to-all ⇒ 256 QPs).
+# Out-SEND-UD always uses 1 QP inside the binary.
 #
 # Usage: ./scripts/collect_fig6.sh
 set -euo pipefail
@@ -20,7 +19,7 @@ csv_header "$CSV" "curve,n,mops"
 
 NQPS=("${PAPER_NQPS[@]}")
 SIZE=$PAPER_MSG_SIZE
-log "fig6 paper N (connected ⇒ N² QPs); size=${SIZE}B inline+unsig=${PAPER_UNSIG_SCALE}"
+log "fig6 #QPs sweep; size=${SIZE}B inline+unsig=${PAPER_UNSIG_SCALE}"
 
 sync_bins
 kill_bench "$SRV_HOST"
@@ -36,7 +35,7 @@ run_fig6_pair() {
   local n=$3
   local port=$((PORT_BASE + idx))
   idx=$((idx + 1))
-  log "fig6 $curve N=$n mode=$mode (connected QPs=$((n * n)))"
+  log "fig6 $curve nqp=$n mode=$mode"
 
   local pass_log="$RESULTS_DIR/fig6_pass_${curve//\//_}_${n}.log"
   local req_log="$RESULTS_DIR/fig6_req_${curve//\//_}_${n}.log"
@@ -76,7 +75,7 @@ run_fig6_pair() {
   mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
   [[ -n "$mops" ]] || { log "WARN parse $req_log"; return 0; }
   append_csv "$CSV" "$curve,$n,$mops"
-  log "fig6 $curve N=$n total=${mops} Mops"
+  log "fig6 $curve nqp=$n total=${mops} Mops"
 }
 
 for n in "${NQPS[@]}"; do

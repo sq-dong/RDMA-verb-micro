@@ -435,7 +435,7 @@ def plot_fig6(results: Path, demo: bool = False):
     ax.set_ylabel("Throughput (Mops)")
     ax.set_title("Figure 6: UD vs UC for all-to-all (32 byte payloads)")
     _finish_equal_x(
-        ax, ticks_n, "Number of client processes (= number of server processes)"
+        ax, ticks_n, "#QPs at RNIC (paper N=16 all-to-all ⇒ 256 QPs)"
     )
     ax.set_ylim(bottom=0)
     ax.legend(loc="best")
