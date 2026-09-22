@@ -70,13 +70,24 @@ for job in "${JOBS[@]}"; do
     log "WARN timeout $etype $opt"
     continue
   fi
-  [[ $rc -eq 0 ]] || { log "WARN fail $etype $opt"; continue; }
+  [[ $rc -eq 0 ]] || { log "WARN fail $etype $opt rc=$rc"; continue; }
   line=$(grep -E '^fig5 .*ECHO:' "$clt_log" | tail -1 || true)
   mops=$(echo "$line" | sed -n 's/.*: \([0-9.]*\) Mops.*/\1/p')
-  [[ -n "$mops" ]] || { log "WARN parse $clt_log"; continue; }
+  if [[ -z "$mops" ]]; then
+    log "WARN parse $clt_log; tail:"
+    tail -5 "$clt_log" 2>/dev/null || true
+    continue
+  fi
   append_csv "$CSV" "$etype,$opt,$mops"
 done
 
-log "wrote $CSV"
+nrows=$(grep -cve '^\s*$' "$CSV" || true)
+# header + 12 data rows
+if [[ "$nrows" -lt 13 ]]; then
+  log "ERROR: fig5.csv incomplete ($((nrows - 1))/12 bars). Check WARN lines above."
+  exit 1
+fi
+
+log "wrote $CSV ($((nrows - 1)) bars)"
 python3 "$SCRIPT_DIR/plot_paper_figs.py" --fig 5 --results-dir "$RESULTS_DIR"
 cleanup_logs "$RESULTS_DIR"

@@ -196,13 +196,10 @@ static void run_ww(struct cfg *c) {
   int stride = VT_CACHELINE;
   while (stride < c->size)
     stride += VT_CACHELINE;
-  VT_CHECK(stride * win <= (int)VT_BUF_SIZE, "window");
-
-  uint8_t *req_buf = malloc((size_t)c->size);
-  uint8_t *resp_buf = malloc((size_t)c->size);
-  VT_CHECK(req_buf && resp_buf, "malloc");
-  memset(req_buf, 1, (size_t)c->size);
-  memset(resp_buf, 1, (size_t)c->size);
+  /* Receive window + local send staging (must be in MR for --no-inline). */
+  VT_CHECK(stride * win + c->size + 64 <= (int)VT_BUF_SIZE, "window");
+  uint8_t *send_buf = v.buf + (size_t)stride * (size_t)win;
+  memset(send_buf, 1, (size_t)c->size);
 
   struct ibv_send_wr wr[128], *bad;
   struct ibv_sge sgl[128];
@@ -212,9 +209,9 @@ static void run_ww(struct cfg *c) {
   uint64_t lim = c->is_server ? deadline + 3000000000ull : deadline;
 
   /*
-   * ww-echo: signal ONLY wr[0] of each window, then poll 1 CQE.
-   * Ignore -Q for the per-WR pattern; -Q 1 vs 64 is approximated by
-   * whether we also signal the rest when unsig==1 (paper "basic").
+   * ww-echo: post window WRITEs, signal last, poll 1 CQE, wait on flag.
+   * Payload lives in MR (send_buf). ww-echo always inlines; --no-inline
+   * must still DMA from registered memory or we get LOC_PROT_ERR.
    */
   if (c->is_server) {
     printf("fig5 ww server win=%d size=%d\n", win, c->size);
@@ -234,11 +231,10 @@ static void run_ww(struct cfg *c) {
         if (c->unsig <= 1)
           wr[w].send_flags = IBV_SEND_SIGNALED;
         else
-          /* Signal LAST WR so its CQE covers the whole window (SQ reclaim). */
           wr[w].send_flags = (w == win - 1) ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[w].send_flags |= IBV_SEND_INLINE;
-        sgl[w].addr = (uintptr_t)resp_buf;
+        sgl[w].addr = (uintptr_t)send_buf;
         sgl[w].length = (uint32_t)c->size;
         sgl[w].lkey = v.mr->lkey;
         wr[w].wr.rdma.remote_addr = remote.addr + (uint64_t)(stride * w);
@@ -252,11 +248,11 @@ static void run_ww(struct cfg *c) {
     printf("fig5 ww client win=%d size=%d\n", win, c->size);
     fflush(stdout);
     while (1) {
-      /* Check deadline every 256 windows — avoid clock in inner poll. */
       if ((iters & 0xff) == 0 && vt_ns() >= deadline)
         break;
       iters++;
       *flag = 0;
+      send_buf[0] = 1;
       for (int w = 0; w < win; w++) {
         memset(&wr[w], 0, sizeof(wr[w]));
         wr[w].opcode = IBV_WR_RDMA_WRITE;
@@ -269,8 +265,7 @@ static void run_ww(struct cfg *c) {
           wr[w].send_flags = (w == win - 1) ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[w].send_flags |= IBV_SEND_INLINE;
-        req_buf[0] = 1;
-        sgl[w].addr = (uintptr_t)req_buf;
+        sgl[w].addr = (uintptr_t)send_buf;
         sgl[w].length = (uint32_t)c->size;
         sgl[w].lkey = v.mr->lkey;
         wr[w].wr.rdma.remote_addr = remote.addr + (uint64_t)(stride * w);
@@ -294,8 +289,6 @@ done_ww:
     printf("fig5 ww ECHO: %.2f Mops (win=%d)\n", echos / sec / 1e6, win);
     fflush(stdout);
   }
-  free(req_buf);
-  free(resp_buf);
   ibv_destroy_qp(qp);
   vt_close_device(&v);
 }
@@ -348,16 +341,17 @@ static void run_ws(struct cfg *c) {
   memset(v.buf, 0, VT_BUF_SIZE);
   volatile long long *req_slot = (volatile long long *)v.buf;
 
-  uint8_t *resp_buf = malloc((size_t)c->size);
-  VT_CHECK(resp_buf, "malloc");
-  memset(resp_buf, 1, (size_t)c->size);
-
-  long long *req_bufs[128];
-  for (int i = 0; i < postlist; i++) {
-    req_bufs[i] = malloc(c->size < 8 ? 8 : (size_t)c->size);
-    VT_CHECK(req_bufs[i], "req");
-    memset(req_bufs[i], 1, c->size < 8 ? 8 : (size_t)c->size);
-  }
+  /* Staging in MR (ww/ws-echo use malloc+INLINE; --no-inline needs MR).
+   *   [0, 64):        req_slot
+   *   [64, 4096):     UD RECV staging (client)
+   *   [4096, 8192):   server SEND response
+   *   [8192, ...):    client WRITE request postlist slots
+   */
+  int msg = c->size < 8 ? 8 : c->size;
+  uint8_t *resp_buf = v.buf + 4096;
+  memset(resp_buf, 1, (size_t)msg);
+  uint8_t *req_area = v.buf + 8192;
+  VT_CHECK(8192 + (size_t)postlist * (size_t)msg <= VT_BUF_SIZE, "ws");
 
   struct ibv_send_wr wr[128], *bad;
   struct ibv_sge sgl[128];
@@ -372,10 +366,17 @@ static void run_ws(struct cfg *c) {
     tcp_ready(fd, 1);
     close(fd);
     long long last_req = 0;
-    uint64_t nb_dgram = 0;
+    uint64_t nb_dgram = 0, sig_posted = 0, sig_reaped = 0;
     uint64_t lim = deadline + 3000000000ull;
 
     while (vt_ns() < lim) {
+      /* Block until all prior signaled SENDs complete — keeps SQ from
+       * overflowing when catch-up posts a full postlist repeatedly. */
+      while (sig_posted > sig_reaped) {
+        poll_n(dgram_scq, 1);
+        sig_reaped++;
+      }
+
       int nnew = 0;
       while (nnew < postlist) {
         long long cur = *req_slot;
@@ -389,14 +390,8 @@ static void run_ws(struct cfg *c) {
         wr[nnew].num_sge = 1;
         wr[nnew].sg_list = &sgl[nnew];
         wr[nnew].next = NULL;
-        wr[nnew].send_flags =
-            (nb_dgram % (uint64_t)c->unsig == 0) ? IBV_SEND_SIGNALED : 0;
-        /*
-         * Poll PREVIOUS signaled SEND on dgram_scq only — never mid-build
-         * before the WR is posted, and never steal from recv CQ.
-         */
-        if (nb_dgram % (uint64_t)c->unsig == 0 && nb_dgram > 0)
-          poll_n(dgram_scq, 1);
+        int do_sig = (nb_dgram % (uint64_t)c->unsig == 0);
+        wr[nnew].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl_d)
           wr[nnew].send_flags |= IBV_SEND_INLINE;
         wr[nnew].wr.ud.ah = dvq.ah;
@@ -407,11 +402,19 @@ static void run_ws(struct cfg *c) {
         sgl[nnew].lkey = v.mr->lkey;
         if (nnew > 0)
           wr[nnew - 1].next = &wr[nnew];
+        if (do_sig)
+          sig_posted++;
         nb_dgram++;
         nnew++;
       }
-      if (nnew > 0)
+      if (nnew > 0) {
+        /* Always signal the last WR of this doorbell so one CQE reclaims SQ. */
+        if (!(wr[nnew - 1].send_flags & IBV_SEND_SIGNALED)) {
+          wr[nnew - 1].send_flags |= IBV_SEND_SIGNALED;
+          sig_posted++;
+        }
         VT_CHECK(ibv_post_send(dqp, &wr[0], &bad) == 0, "ud send");
+      }
     }
   } else {
     printf("fig5 ws client postlist=%d pipeline=%d\n", postlist, pipeline);
@@ -428,12 +431,12 @@ static void run_ws(struct cfg *c) {
 
       /*
        * Reap prior signaled WRITE completions BEFORE building the next
-       * postlist. Never poll inside the build loop for a CQE that is not
-       * posted yet (-Q 1 deadlock).
+       * postlist. With -Q 1 every WR is signaled → poll a full postlist.
        */
       if (nb_tx > 0) {
-        uint64_t prev_first = nb_tx - (uint64_t)postlist;
-        if (prev_first % (uint64_t)c->unsig == 0)
+        if (c->unsig <= 1)
+          poll_n(conn_cq, postlist);
+        else if ((nb_tx - (uint64_t)postlist) % (uint64_t)c->unsig == 0)
           poll_n(conn_cq, 1);
       }
 
@@ -447,8 +450,8 @@ static void run_ws(struct cfg *c) {
             goto ws_done;
           echos++;
         }
-        /* Always post a RECV credit (ws-echo). */
-        post_recv(dqp, &v, (uintptr_t)v.buf + 4096, 4096, (uint64_t)i);
+        /* RECV staging: after req_slot, before send staging. */
+        post_recv(dqp, &v, (uintptr_t)(v.buf + 64), 2048, (uint64_t)i);
 
         memset(&wr[i], 0, sizeof(wr[i]));
         wr[i].opcode = IBV_WR_RDMA_WRITE;
@@ -461,9 +464,10 @@ static void run_ws(struct cfg *c) {
           wr[i].send_flags |= IBV_SEND_INLINE;
 
         req_seq++;
-        req_bufs[i][0] = req_seq;
-        sgl[i].addr = (uintptr_t)req_bufs[i];
-        sgl[i].length = (uint32_t)(c->size < 8 ? 8 : c->size);
+        long long *slot = (long long *)(req_area + (size_t)i * (size_t)msg);
+        slot[0] = req_seq;
+        sgl[i].addr = (uintptr_t)slot;
+        sgl[i].length = (uint32_t)msg;
         sgl[i].lkey = v.mr->lkey;
         wr[i].wr.rdma.remote_addr = cremote.addr;
         wr[i].wr.rdma.rkey = cremote.rkey;
@@ -489,9 +493,6 @@ static void run_ws(struct cfg *c) {
     }
   }
 
-  for (int i = 0; i < postlist; i++)
-    free(req_bufs[i]);
-  free(resp_buf);
   if (dvq.ah)
     ibv_destroy_ah(dvq.ah);
   ibv_destroy_qp(cqp);
@@ -540,8 +541,7 @@ static void run_ss(struct cfg *c) {
   if (use_ud)
     vt_create_ud_ah(&v, &vq);
 
-  uint8_t *payload = malloc((size_t)c->size);
-  VT_CHECK(payload, "malloc");
+  uint8_t *payload = v.buf + (VT_BUF_SIZE / 2);
   memset(payload, 1, (size_t)c->size);
 
   uint32_t recv_len =
@@ -560,6 +560,7 @@ static void run_ss(struct cfg *c) {
   struct ibv_sge sgl[128];
   struct ibv_wc wc[128];
   uint64_t nb_tx = 0, echos = 0, rolling = 0;
+  uint64_t sig_posted = 0, sig_reaped = 0;
   uint64_t t0 = vt_ns();
   uint64_t deadline = t0 + (uint64_t)c->duration * 1000000000ull;
 
@@ -580,10 +581,16 @@ static void run_ss(struct cfg *c) {
         }
         post_recv(qp, &v, (uintptr_t)v.buf, recv_len, wc[i].wr_id);
       }
-      /* Poll prior signaled SEND before building (must be from earlier post_send). */
-      if (nb_tx > 0) {
-        if (c->unsig <= 1 || (nb_tx % (uint64_t)c->unsig == 0))
-          poll_n(scq, 1);
+      /* Reap prior SEND CQEs before posting more (safe for -Q 1). */
+      while (sig_posted > sig_reaped) {
+        struct ibv_wc swc;
+        if (ibv_poll_cq(scq, 1, &swc) == 0)
+          break;
+        if (swc.status != IBV_WC_SUCCESS) {
+          fprintf(stderr, "send %s\n", ibv_wc_status_str(swc.status));
+          goto ss_done;
+        }
+        sig_reaped++;
       }
       for (int i = 0; i < n; i++) {
         memset(&wr[i], 0, sizeof(wr[i]));
@@ -591,11 +598,9 @@ static void run_ss(struct cfg *c) {
         wr[i].num_sge = 1;
         wr[i].next = (i == n - 1) ? NULL : &wr[i + 1];
         wr[i].sg_list = &sgl[i];
-        if (c->unsig <= 1)
-          wr[i].send_flags = (i == 0) ? IBV_SEND_SIGNALED : 0;
-        else
-          wr[i].send_flags =
-              (nb_tx % (uint64_t)c->unsig == 0) ? IBV_SEND_SIGNALED : 0;
+        int do_sig = (c->unsig <= 1) ? (i == n - 1)
+                                     : (nb_tx % (uint64_t)c->unsig == 0);
+        wr[i].send_flags = do_sig ? IBV_SEND_SIGNALED : 0;
         if (c->use_inline && c->size <= inl)
           wr[i].send_flags |= IBV_SEND_INLINE;
         if (use_ud) {
@@ -606,6 +611,8 @@ static void run_ss(struct cfg *c) {
         sgl[i].addr = (uintptr_t)payload;
         sgl[i].length = (uint32_t)c->size;
         sgl[i].lkey = v.mr->lkey;
+        if (do_sig)
+          sig_posted++;
         nb_tx++;
       }
       VT_CHECK(ibv_post_send(qp, &wr[0], &bad) == 0, "send");
@@ -655,7 +662,6 @@ static void run_ss(struct cfg *c) {
   }
 
 ss_done:
-  free(payload);
   if (vq.ah)
     ibv_destroy_ah(vq.ah);
   ibv_destroy_qp(qp);
